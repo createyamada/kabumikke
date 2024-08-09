@@ -1,21 +1,8 @@
 import pandas as pd
 from datetime import datetime
 from datetime import timedelta
+from library import config
 
-
-# 説明変数として取得するデータ名の配列
-REQUIRE_DATA = [
-    'High',
-    'Low',
-    'Open',
-    'Close',
-    'Body',
-    'Close_diff',
-    'SMA5',
-    'SMA25',
-    'SMA70',
-    'Close_next'
-]
 
 def merge_all_company_info(infos:list):
     """
@@ -71,9 +58,8 @@ def merge_all_company_info(infos:list):
     merged_df['SMA70'] = merged_df['Close'].rolling(70).mean()
 
     # 説明変数として取得するデータだけを抽出
-    data_technical = merged_df[REQUIRE_DATA]
+    data_technical = merged_df[config.EXPLANATORY_VARIABLES]
 
-    # TODO 要検討
     # 欠損値削除
     data_technical = data_technical.dropna(how='any')
 
@@ -106,19 +92,17 @@ def get_divided_data(data):
     Returns:
     - result {学習用,検証用}
     """
-    # print('data')
-    # print(data.index.tolist())
     dates = get_divided_date(data.index.tolist(),365)
+
+
     # それぞれデータを作成
     train = data[dates['start'] : dates['start_end']]
     test = data[dates['end_start'] :]
-    # それぞれを説明変数と目的変数に分離する
+    # 学習用データとテストデータそれぞれを説明変数と目的変数に分離する
     X_train = train.drop(columns=['Close_next'])
     Y_train = train['Close_next']
-
-    X_test = train.drop(columns=['Close_next'])
-    Y_test = train['Close_next']
-
+    X_test = test.drop(columns=['Close_next'])
+    Y_test = pd.DataFrame(test['Close_next'],columns=['Close_next'])
 
     return {
         'X_train':X_train,

@@ -5,10 +5,60 @@ from sklearn.linear_model import LinearRegression
 from sklearn.model_selection import TimeSeriesSplit
 # 予測精度検証のためMSEをインポート
 from sklearn.metrics import mean_squared_error as mse
+from sklearn.ensemble import RandomForestClassifier
 import numpy as np
 import pandas as pd
-from library import finance
 from library import format
+from library import config
+import yfinance as yf
+
+
+
+def get_company_info(code_ :str):
+    """
+    特定コードの企業情報を取得する
+
+    Parameters:
+    - code_:str 株価コード
+    Returns:
+    - result: object 企業情報
+    """
+
+    return yf.Ticker(code_+".T")
+
+
+def get_analysis_data(company):
+    """
+    分析のためのデータを取得する
+
+    Parameters:
+    - company:str 特定の企業データ(yfinanceで取得)
+
+    Returns:
+    - result: 全分析データフレームの配列
+    """
+    result = [];
+
+    # 企業の株価時系列
+    result.append(company.history(period="max"))
+
+    # 配当金及び株式分割の確定日を取得
+    result.append(company.actions)
+
+    # # 財務諸表直近四年分
+    result.append(company.financials)
+
+    # # 財務諸表直近四半期分取得
+    result.append(company.quarterly_financials)
+
+    # # バランスシート直近4年分
+    result.append(company.balance_sheet)
+
+    # # バランスシート直近四半期分
+    result.append(company.quarterly_balance_sheet)
+
+    # 個別のデータフレームを1つのデータフレームにまとめデータを整形する
+    return format.merge_all_company_info(result)
 
 
 def get_prediction(code):
@@ -23,15 +73,15 @@ def get_prediction(code):
 
 
     # 企業情報を取得
-    company = finance.get_company_info(code)
+    company = get_company_info(code)
     # 分析に必要な株価財務データを取得
-    datas = finance.get_analysis_data(company)
+    datas = get_analysis_data(company)
     # 分析に必要な学習用、検証用データに分ける
     divided_datas = format.get_divided_data(datas)
-    # 時系列交差分析を行う
+    # 時系列交差分析を行う(検証時に利用)
     # scores = time_series_cross_analysis(divided_datas)
+
     # 予測を行う
-    # print(divided_datas)
     return {
         'prediction':price_predict(divided_datas),
         'company':company.info.get('longName', 'No name found')
@@ -75,13 +125,14 @@ def time_series_cross_analysis(divided_datas):
 
 def price_predict(divided_datas):
     """
-    価格を重回帰分析により予測する
+    重回帰分析により予測する
 
     Parameters:
     - divided_datas 学習用、テスト用をそれぞれ目的変数、説明変数に分けたObject
     Returns:
     - result 予想結果
     """
+
 
 
     model = LinearRegression()
@@ -92,8 +143,8 @@ def price_predict(divided_datas):
     Y_pred = model.predict(divided_datas['X_test'])
 
     # 予測モデルの係数を確認
-    coef = pd.DataFrame(model.coef_)
-    coef.index = divided_datas['X_train'].columns
+    # coef = pd.DataFrame(model.coef_)
+    # coef.index = divided_datas['X_train'].columns
 
     # 予測モデルの切片を取得
     # model.intercept_
@@ -106,18 +157,18 @@ def price_predict(divided_datas):
 
     # 過去の実際データを取得
     result = divided_datas['Y_test']
-    df = pd.DataFrame(result)
-    df['Close_pred'] = Y_pred
+    result['Close_pred'] = Y_pred
 
-    # データの形式を確認
-    print("Data types:")
-    print(df.dtypes)
-    print(df)
+    # 明日の株価を予測
+    df = pd.DataFrame(divided_datas['X_test'])
+    last_data = df[config.EXPLANATORY_VARIABLES_ANALYSIS].iloc[-1].values.reshape(1, -1)
+    tomorrow_prediction = model.predict(last_data)
 
 
     return {
-        'close_next':df['Close_next'].to_dict(),
-        'close_pred':df['Close_pred'].to_dict(),
+        'close_next':result['Close_next'].to_dict(),
+        'close_pred':result['Close_pred'].to_dict(),
+        'tomorrow_value':tomorrow_prediction
         'score':np.mean(score)
     }
 
