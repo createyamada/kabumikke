@@ -8,6 +8,8 @@ from sklearn.metrics import mean_squared_error as mse
 from sklearn.ensemble import RandomForestClassifier
 import numpy as np
 import pandas as pd
+from datetime import datetime
+from datetime import timedelta
 from library import format
 from library import config
 import yfinance as yf
@@ -163,13 +165,45 @@ def price_predict(divided_datas):
     df = pd.DataFrame(divided_datas['X_test'])
     last_data = df[config.EXPLANATORY_VARIABLES_ANALYSIS].iloc[-1].values.reshape(1, -1)
     tomorrow_prediction = model.predict(last_data)
+    
+    # データフレームに追加する新しい行を作成
+    new_row = pd.DataFrame({
+        'Close_next': 0,
+        'Close_pred': tomorrow_prediction[0],
+    },index=[get_next_weekday(str(result.index[-1].strftime('%Y-%m-%d')))])
 
-
+    # 行を追加
+    result = pd.concat([result, new_row])
+    
     return {
         'close_next':result['Close_next'].to_dict(),
         'close_pred':result['Close_pred'].to_dict(),
-        'tomorrow_value':tomorrow_prediction,
         'score':np.mean(score)
     }
+
+
+
+def get_next_weekday(date_str):
+    """
+    翌営業日を取得する
+
+    Parameters:
+    - date 日付
+    Returns:
+    - result 翌営業日
+    """
+
+    # 文字列を datetime オブジェクトに変換
+    date = datetime.strptime(date_str, '%Y-%m-%d')
+    
+    # 次の日を計算
+    next_day = date + timedelta(days=1)
+    
+    # 次の日が土日であるか確認
+    while next_day.weekday() in [5, 6]:  # 5 = 土曜日, 6 = 日曜日
+        next_day += timedelta(days=1)
+    
+    # YYYY-MM-DD 形式の文字列に変換
+    return next_day.strftime('%Y-%m-%d')
 
 
