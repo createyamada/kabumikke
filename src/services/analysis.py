@@ -168,7 +168,7 @@ def price_predict(divided_datas):
     return {
         'close_next':result['Close_next'].to_dict(),
         'close_pred':result['Close_pred'].to_dict(),
-        'tomorrow_value':tomorrow_prediction
+        'tomorrow_value':tomorrow_prediction,
         'score':np.mean(score)
     }
 
