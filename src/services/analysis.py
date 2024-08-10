@@ -172,9 +172,11 @@ def price_predict(divided_datas):
         'Close_pred': tomorrow_prediction[0],
     },index=[get_next_weekday(str(result.index[-1].strftime('%Y-%m-%d')))])
 
+    # インデックスをYYYY-MM-DD形式の文字列に変換
+    result.index = result.index.strftime('%Y-%m-%d')
     # 行を追加
     result = pd.concat([result, new_row])
-    
+
     return {
         'close_next':result['Close_next'].to_dict(),
         'close_pred':result['Close_pred'].to_dict(),
