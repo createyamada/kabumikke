@@ -10,7 +10,13 @@ EXPLANATORY_VARIABLES = [
     'SMA25',
     'SMA70',
     'Volume',
-    'Close_next'
+    'Close_next',
+    'nikkei_open',
+    'nikkei_close',
+    'dow_open',
+    'dow_close',
+    'jpy_open',
+    'jpy_close',
 ]
 
 # 予測に使用する説明変数
@@ -25,6 +31,12 @@ EXPLANATORY_VARIABLES_ANALYSIS = [
     'SMA25',
     'SMA70',
     'Volume',
+    'nikkei_open',
+    'nikkei_close',
+    'dow_open',
+    'dow_close',
+    'jpy_open',
+    'jpy_close',
 ]
 
 # 目的変数として取得するデータ名の配列

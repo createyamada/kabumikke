@@ -41,8 +41,32 @@ def get_analysis_data(company):
     """
     result = [];
 
+
     # 企業の株価時系列
     result.append(company.history(period="max"))
+
+
+    # 日経平均株価を取得する
+    nikkei = yf.Ticker("^N225")
+    nikkei_info = nikkei.history(period="max")
+    nikkei_info = nikkei_info[["Open", "Close"]]
+    nikkei_info = nikkei_info.rename(columns={'Open': 'nikkei_open','Close': 'nikkei_close' })
+    result.append(nikkei_info)
+
+    # ドル円を取得する
+    jpy = yf.Ticker("JPY=X")
+    jpy_info = jpy.history(period="max")
+    jpy_info = jpy_info[["Open", "Close"]]
+    jpy_info = jpy_info.rename(columns={'Open': 'jpy_open','Close': 'jpy_close' })
+    result.append(jpy_info)
+
+
+    # ニューヨークダウ平均株価を取得する
+    dow = yf.Ticker("^DJI")
+    dow_info = dow.history(period="max")
+    dow_info = dow_info[["Open", "Close"]]
+    dow_info = dow_info.rename(columns={'Open': 'dow_open','Close': 'dow_close' })
+    result.append(dow_info)
 
     # 配当金及び株式分割の確定日を取得
     result.append(company.actions)
@@ -78,6 +102,7 @@ def get_prediction(code):
     company = get_company_info(code)
     # 分析に必要な株価財務データを取得
     datas = get_analysis_data(company)
+
     # 分析に必要な学習用、検証用データに分ける
     divided_datas = format.get_divided_data(datas)
     # 時系列交差分析を行う(検証時に利用)
@@ -135,54 +160,54 @@ def price_predict(divided_datas):
     - result 予想結果
     """
 
+    # 説明変数の中で、X_train に存在するカラムのみを使用
+    available_columns = [col for col in config.EXPLANATORY_VARIABLES_ANALYSIS if col in divided_datas['X_train'].columns]
 
+    if not available_columns:
+        raise ValueError("使用できる説明変数がありません。データの前処理を確認してください。")
 
     model = LinearRegression()
-    # 説明変数、目的変数を指定
-    model.fit(divided_datas['X_train'], divided_datas['Y_train'])
+
+    # モデル学習
+    model.fit(divided_datas['X_train'][available_columns], divided_datas['Y_train'])
 
     # テストデータにて予測する
-    Y_pred = model.predict(divided_datas['X_test'])
+    Y_pred = model.predict(divided_datas['X_test'][available_columns])
 
-    # 予測モデルの係数を確認
-    # coef = pd.DataFrame(model.coef_)
-    # coef.index = divided_datas['X_train'].columns
-
-    # 予測モデルの切片を取得
-    # model.intercept_
-
-    # X_train基本統計量確認
-    # divided_datas['X_train'].discribe()
-
-    # テストデータのスコアを取得
+    # テストデータのスコアを取得（RMSE）
     score = np.sqrt(mse(divided_datas['Y_test'], Y_pred))
 
     # 過去の実際データを取得
-    result = divided_datas['Y_test']
+    result = divided_datas['Y_test'].copy()
     result['Close_pred'] = Y_pred
 
     # 明日の株価を予測
     df = pd.DataFrame(divided_datas['X_test'])
-    last_data = df[config.EXPLANATORY_VARIABLES_ANALYSIS].iloc[-1].values.reshape(1, -1)
-    tomorrow_prediction = model.predict(last_data)
-    
-    # データフレームに追加する新しい行を作成
-    new_row = pd.DataFrame({
-        'Close_next': 0,
-        'Close_pred': tomorrow_prediction[0],
-    },index=[get_next_weekday(str(result.index[-1].strftime('%Y-%m-%d')))])
 
-    # インデックスをYYYY-MM-DD形式の文字列に変換
+    # 最終行の説明変数を取得
+    last_data = df[available_columns].iloc[-1].values.reshape(1, -1)
+    tomorrow_prediction = model.predict(last_data)[0]
+
+    # 翌営業日の日付を取得
+    next_business_day = get_next_weekday(str(result.index[-1].strftime('%Y-%m-%d')))
+
+    # データフレームに新しい行を追加
+    new_row = pd.DataFrame({
+        'Close_next': [0],  # 実際の値はないため 0
+        'Close_pred': [tomorrow_prediction],
+    }, index=[next_business_day])
+
+    # インデックスを YYYY-MM-DD 形式に変更
     result.index = result.index.strftime('%Y-%m-%d')
+
     # 行を追加
     result = pd.concat([result, new_row])
 
     return {
-        'close_next':result['Close_next'].to_dict(),
-        'close_pred':result['Close_pred'].to_dict(),
-        'score':np.mean(score)
+        'close_next': result['Close_next'].to_dict(),
+        'close_pred': result['Close_pred'].to_dict(),
+        'score': float(score)  # numpy.float を Python の float に変換
     }
-
 
 
 def get_next_weekday(date_str):
@@ -190,22 +215,19 @@ def get_next_weekday(date_str):
     翌営業日を取得する
 
     Parameters:
-    - date 日付
+    - date_str: str (YYYY-MM-DD形式の日付)
     Returns:
-    - result 翌営業日
+    - result: str (YYYY-MM-DD形式の翌営業日)
     """
 
-    # 文字列を datetime オブジェクトに変換
+    # 文字列を datetime に変換
     date = datetime.strptime(date_str, '%Y-%m-%d')
-    
-    # 次の日を計算
+
+    # 翌日を計算
     next_day = date + timedelta(days=1)
-    
-    # 次の日が土日であるか確認
-    while next_day.weekday() in [5, 6]:  # 5 = 土曜日, 6 = 日曜日
+
+    # 土日なら次の平日まで進める
+    while next_day.weekday() in [5, 6]:  # 5 = 土曜, 6 = 日曜
         next_day += timedelta(days=1)
-    
-    # YYYY-MM-DD 形式の文字列に変換
+
     return next_day.strftime('%Y-%m-%d')
-
-

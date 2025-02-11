@@ -4,67 +4,45 @@ from datetime import timedelta
 from library import config
 
 
-def merge_all_company_info(infos:list):
+def merge_all_company_info(infos: list):
     """
     リストの要素数分データフレームを紐づける
 
     Parameters:
-    - info:list 企業情報
+    - infos: list 企業情報
     Returns:
-    - result:Dataframe 企業情報
+    - result: DataFrame 企業情報
     """
 
-
-    # リストの要素数分データフレームを紐づける
     for index, info in enumerate(infos):
         if index == 0:
-            # 先頭データの場合
             merged_df = dataframe_index_to_clumn(info)
-            continue
-
         else:
-            # 先頭データでない場合
             if info.index.name != 'Date':
-                # インデックスにDateが設定されていない場合
-                info = dataframe_index_to_clumn(info.T)
-            else:
                 info = dataframe_index_to_clumn(info)
 
+            merged_df = pd.merge(merged_df, info, on='Date', how="left")
 
-        # 前回のデータフレームと日付をキーにしてマージ
-        merged_df = pd.merge(merged_df,info,on='Date',how="left")
-
-    # DateをDatetime64型に変換
     merged_df['Date'] = pd.to_datetime(merged_df['Date'])
-    # 曜日情報を追加(月曜:0, 火曜:1, 水曜:2, 木曜:3, 金曜:4, 土曜:5, 日曜:6)
     merged_df['weekday'] = merged_df['Date'].dt.weekday
-    # 先頭の日付を取得
+
     start = merged_df.iloc[0]['Date']
-    # 先頭の月曜日を基準に週を追加
     merged_df['weeks'] = (merged_df['Date'] - start) // timedelta(weeks=1)
-    # 日付をインデックスにセット
+
     merged_df.set_index(keys='Date', inplace=True)
-    # データの並び替え
     merged_df.sort_values(by='Date', ascending=True, inplace=True)
-    # 始値と終値の差分を追加
-    merged_df['Body'] = merged_df['Open'] - merged_df['Close']
-    # 翌日の終値と本日の終値の差分を追加する
-    merged_df['Close_diff'] = merged_df['Close'].diff(1)
-    # 目的変数となる翌日の終値を追加
+
+    merged_df['Body'] = (merged_df['Open'] - merged_df['Close']).fillna(0)
+    merged_df['Close_diff'] = merged_df['Close'].diff(1).fillna(0)
     merged_df['Close_next'] = merged_df['Close'].shift(-1)
-    # 移動平均を追加
-    merged_df['SMA5'] = merged_df['Close'].rolling(5).mean()
-    merged_df['SMA25'] = merged_df['Close'].rolling(25).mean()
-    merged_df['SMA70'] = merged_df['Close'].rolling(70).mean()
 
-    # 説明変数として取得するデータだけを抽出
-    data_technical = merged_df[config.EXPLANATORY_VARIABLES]
+    merged_df['SMA5'] = merged_df['Close'].rolling(5, min_periods=1).mean()
+    merged_df['SMA25'] = merged_df['Close'].rolling(25, min_periods=1).mean()
+    merged_df['SMA70'] = merged_df['Close'].rolling(70, min_periods=1).mean()
 
-    # 欠損値削除
-    data_technical = data_technical.dropna(how='any')
+    data_technical = merged_df[config.EXPLANATORY_VARIABLES].dropna(how='any')
 
     return data_technical
-
 
 
 def dataframe_index_to_clumn(data):
