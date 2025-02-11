@@ -72,16 +72,16 @@ def get_analysis_data(company):
     result.append(company.actions)
 
     # # 財務諸表直近四年分
-    result.append(company.financials)
+    # result.append(company.financials)
 
     # # 財務諸表直近四半期分取得
-    result.append(company.quarterly_financials)
+    # result.append(company.quarterly_financials)
 
     # # バランスシート直近4年分
-    result.append(company.balance_sheet)
+    # result.append(company.balance_sheet)
 
     # # バランスシート直近四半期分
-    result.append(company.quarterly_balance_sheet)
+    # result.append(company.quarterly_balance_sheet)
 
     # 個別のデータフレームを1つのデータフレームにまとめデータを整形する
     return format.merge_all_company_info(result)
@@ -185,7 +185,7 @@ def price_predict(divided_datas):
     df = pd.DataFrame(divided_datas['X_test'])
 
     # 最終行の説明変数を取得
-    last_data = df[available_columns].iloc[-1].values.reshape(1, -1)
+    last_data = divided_datas['last_data']
     tomorrow_prediction = model.predict(last_data)[0]
 
     # 翌営業日の日付を取得

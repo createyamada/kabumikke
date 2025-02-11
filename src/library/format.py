@@ -1,27 +1,37 @@
 import pandas as pd
-from datetime import datetime
-from datetime import timedelta
+from datetime import datetime, timedelta
 from library import config
-
 
 def merge_all_company_info(infos: list):
     """
-    リストの要素数分データフレームを紐づける
+    リストの要素数分データフレームを結合する
 
     Parameters:
     - infos: list 企業情報
     Returns:
     - result: DataFrame 企業情報
     """
+    merged_df = None
 
     for index, info in enumerate(infos):
-        if index == 0:
-            merged_df = dataframe_index_to_clumn(info)
-        else:
-            if info.index.name != 'Date':
-                info = dataframe_index_to_clumn(info)
+        if info.empty:
+            print(f"Warning: DataFrame at index {index} is empty. Skipping...")
+            continue
 
+        # Date カラムがない場合、インデックスをリセットして確保
+        if 'Date' not in info.columns:
+            info = dataframe_index_to_clumn(info)
+
+        # Date カラムの型を統一
+        info['Date'] = pd.to_datetime(info['Date']).dt.tz_localize(None)
+
+        if merged_df is None:
+            merged_df = info
+        else:
             merged_df = pd.merge(merged_df, info, on='Date', how="left")
+
+    if merged_df is None or merged_df.empty:
+        raise ValueError("Error: No valid dataframes found to merge.")
 
     merged_df['Date'] = pd.to_datetime(merged_df['Date'])
     merged_df['weekday'] = merged_df['Date'].dt.weekday
@@ -39,11 +49,9 @@ def merge_all_company_info(infos: list):
     merged_df['SMA5'] = merged_df['Close'].rolling(5, min_periods=1).mean()
     merged_df['SMA25'] = merged_df['Close'].rolling(25, min_periods=1).mean()
     merged_df['SMA70'] = merged_df['Close'].rolling(70, min_periods=1).mean()
-
-    data_technical = merged_df[config.EXPLANATORY_VARIABLES].dropna(how='any')
-
-    return data_technical
-
+    # 配列に含まれる列名のみを抽出
+    merged_df = merged_df[config.EXPLANATORY_VARIABLES]
+    return merged_df
 
 def dataframe_index_to_clumn(data):
     """
@@ -56,10 +64,9 @@ def dataframe_index_to_clumn(data):
     """
     data.reset_index(inplace=True)
     result = data.rename(columns={'index': 'Date'})
-    # タイムゾーン情報を削除する
-    result['Date'] = result['Date'].dt.tz_localize(None)
+    # タイムゾーン情報を削除し、型を統一
+    result['Date'] = pd.to_datetime(result['Date']).dt.tz_localize(None)
     return result
-
 
 def get_divided_data(data):
     """
@@ -70,27 +77,28 @@ def get_divided_data(data):
     Returns:
     - result {学習用,検証用}
     """
-    dates = get_divided_date(data.index.tolist(),365)
-
+    dates = get_divided_date(data.index.tolist(), 365)
 
     # それぞれデータを作成
-    train = data[dates['start'] : dates['start_end']]
-    test = data[dates['end_start'] :]
+    train = data[dates['start']: dates['start_end']].dropna(how="any")
+    test = data[dates['end_start']:].dropna(how="any")
+
+
     # 学習用データとテストデータそれぞれを説明変数と目的変数に分離する
     X_train = train.drop(columns=['Close_next'])
     Y_train = train['Close_next']
     X_test = test.drop(columns=['Close_next'])
-    Y_test = pd.DataFrame(test['Close_next'],columns=['Close_next'])
+    Y_test = pd.DataFrame(test['Close_next'], columns=['Close_next'])
 
     return {
-        'X_train':X_train,
-        'Y_train':Y_train,
-        'X_test':X_test,
-        'Y_test':Y_test,
+        'X_train': X_train,
+        'Y_train': Y_train,
+        'X_test': X_test,
+        'Y_test': Y_test,
+        'last_data': data[config.EXPLANATORY_VARIABLES_ANALYSIS].iloc[-1].values.reshape(1, -1),
     }
 
-
-def get_divided_date(data,days):
+def get_divided_date(data, days):
     """
     データフレームの年月日の指定日付前の年月日を取得
 
@@ -100,14 +108,10 @@ def get_divided_date(data,days):
     Returns:
     - result {最初の日、指定日の前日、指定日、最後の日}
     """
+    data.sort()
     return {
-        'start':data[0].strftime('%Y-%m-%d'),
+        'start': data[0].strftime('%Y-%m-%d'),
         'start_end': (data[-1] - timedelta(days=days) - timedelta(days=1)).strftime('%Y-%m-%d'),
         'end_start': (data[-1] - timedelta(days=days)).strftime('%Y-%m-%d'),
-        'end':data[-1].strftime('%Y-%m-%d')
+        'end': data[-1].strftime('%Y-%m-%d')
     }
-
-
-
-
-
