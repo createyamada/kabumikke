@@ -20,4 +20,4 @@ COPY . /src
 
 EXPOSE 8888
 
-CMD ["uvicorn", "app.api.app:app", "--reload", "--workers", "1", "--host", "0.0.0.0", "--port", "8888"]
+CMD ["uvicorn", "src.app.api.app:app", "--reload", "--workers", "1", "--host", "0.0.0.0", "--port", "8888"]
