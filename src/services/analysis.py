@@ -1,4 +1,4 @@
-
+from fastapi import FastAPI, HTTPException
 # 線形回帰モデルのLinearRegressionをインポート
 from sklearn.linear_model import LinearRegression
 # 時系列分割のためTimeSeriesSplitのインポート
@@ -13,20 +13,6 @@ from datetime import timedelta
 from library import format
 from library import config
 import yfinance as yf
-
-
-
-def get_company_info(code_ :str):
-    """
-    特定コードの企業情報を取得する
-
-    Parameters:
-    - code_:str 株価コード
-    Returns:
-    - result: object 企業情報
-    """
-
-    return yf.Ticker(code_+".T")
 
 
 def get_analysis_data(company):
@@ -55,7 +41,7 @@ def get_analysis_data(company):
 
     # ドル円を取得する
     jpy = yf.Ticker("JPY=X")
-    jpy_info = jpy.history(period="max")
+    jpy_info = jpy.history(period="max",prepost=True,actions=False )
     jpy_info = jpy_info[["Open", "Close"]]
     jpy_info = jpy_info.rename(columns={'Open': 'jpy_open','Close': 'jpy_close' })
     result.append(jpy_info)
@@ -67,6 +53,13 @@ def get_analysis_data(company):
     dow_info = dow_info[["Open", "Close"]]
     dow_info = dow_info.rename(columns={'Open': 'dow_open','Close': 'dow_close' })
     result.append(dow_info)
+
+    mini_dow = yf.Ticker("YM=F")
+    mini_dow_info = mini_dow.history(period="max")
+    mini_dow_info = mini_dow_info[["Open", "Close"]]
+    mini_dow_info = mini_dow_info.rename(columns={'Open': 'mini_dow_open','Close': 'mini_dow_close' })
+    result.append(mini_dow_info)
+    
 
     # 配当金及び株式分割の確定日を取得
     result.append(company.actions)
@@ -96,21 +89,30 @@ def get_prediction(code):
     Returns:
     - result 
     """
+    try :
+        # 企業情報を取得
+        company = yf.Ticker(code_+".T")
+    except Exception as e :
+        error_message = "企業データが存在しません、銘柄コードを確認してください"
+        raise HTTPException(status_code=500, detail=error_message)
 
+    try :
 
-    # 企業情報を取得
-    company = get_company_info(code)
-    # 分析に必要な株価財務データを取得
-    datas = get_analysis_data(company)
+        # 分析に必要な株価財務データを取得
+        datas = get_analysis_data(company)
 
-    # 分析に必要な学習用、検証用データに分ける
-    divided_datas = format.get_divided_data(datas)
-    # 時系列交差分析を行う(検証時に利用)
-    # scores = time_series_cross_analysis(divided_datas)
+        # 分析に必要な学習用、検証用データに分ける
+        divided_datas = format.get_divided_data(datas)
+        # 時系列交差分析を行う(検証時に利用)
+        # scores = time_series_cross_analysis(divided_datas)
+        price_prediction = price_predict(divided_datas)
+    except Exception as e :
+        error_message = "分析データの整形に失敗しました。再度試してください。"
+        raise HTTPException(status_code=500, detail=error_message)
 
     # 予測を行う
     return {
-        'prediction':price_predict(divided_datas),
+        'prediction':price_prediction,
         'company':company.info.get('longName', 'No name found')
     }
 
@@ -193,7 +195,7 @@ def price_predict(divided_datas):
 
     # データフレームに新しい行を追加
     new_row = pd.DataFrame({
-        'Close_next': [0],  # 実際の値はないため 0
+        'Close_next': [0],
         'Close_pred': [tomorrow_prediction],
     }, index=[next_business_day])
 
@@ -206,7 +208,7 @@ def price_predict(divided_datas):
     return {
         'close_next': result['Close_next'].to_dict(),
         'close_pred': result['Close_pred'].to_dict(),
-        'score': float(score)  # numpy.float を Python の float に変換
+        'score': float(score)
     }
 
 
@@ -227,7 +229,7 @@ def get_next_weekday(date_str):
     next_day = date + timedelta(days=1)
 
     # 土日なら次の平日まで進める
-    while next_day.weekday() in [5, 6]:  # 5 = 土曜, 6 = 日曜
+    while next_day.weekday() in [5, 6]:
         next_day += timedelta(days=1)
 
     return next_day.strftime('%Y-%m-%d')

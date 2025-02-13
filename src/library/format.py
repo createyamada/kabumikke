@@ -50,7 +50,7 @@ def merge_all_company_info(infos: list):
     merged_df['SMA25'] = merged_df['Close'].rolling(25, min_periods=1).mean()
     merged_df['SMA70'] = merged_df['Close'].rolling(70, min_periods=1).mean()
     # 配列に含まれる列名のみを抽出
-    merged_df = merged_df[config.EXPLANATORY_VARIABLES]
+    # merged_df = merged_df[config.EXPLANATORY_VARIABLES]
     return merged_df
 
 def dataframe_index_to_clumn(data):
@@ -79,9 +79,15 @@ def get_divided_data(data):
     """
     dates = get_divided_date(data.index.tolist(), 365)
 
+    if pd.isna(data[config.EXPLANATORY_VARIABLES_ANALYSIS].iloc[-1]["dow_open"]):
+        data.loc[data.index[-1], 'dow_open'] = data.iloc[-1]["mini_dow_open"]
+        data.loc[data.index[-1], 'dow_close'] = data.iloc[-1]["mini_dow_close"]
+
+    last_data = data[config.EXPLANATORY_VARIABLES_ANALYSIS].iloc[-1].values.reshape(1, -1)
+
     # それぞれデータを作成
-    train = data[dates['start']: dates['start_end']].dropna(how="any")
-    test = data[dates['end_start']:].dropna(how="any")
+    train = data[config.EXPLANATORY_VARIABLES][dates['start']: dates['start_end']].dropna(how="any")
+    test = data[config.EXPLANATORY_VARIABLES][dates['end_start']:].dropna(how="any")
 
 
     # 学習用データとテストデータそれぞれを説明変数と目的変数に分離する
