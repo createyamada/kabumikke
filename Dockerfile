@@ -18,6 +18,9 @@ RUN set -eux \
 
 COPY . /src
 
+# ここを追加（`app` を認識できるようにする）
+ENV PYTHONPATH=/src
+
 EXPOSE 8888
 
-CMD ["uvicorn", "src.app.api.app:app", "--reload", "--workers", "1", "--host", "0.0.0.0", "--port", "8888"]
+CMD ["uvicorn", "app.api.app:app", "--host", "0.0.0.0", "--port", "8888"]
