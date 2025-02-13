@@ -14,13 +14,4 @@ RUN set -eux \
     && apt-get remove --purge -y build-essential \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/* \
-    && rm -rf /root/.cache/pip 
-
-COPY . /src
-
-# 変更: PYTHONPATH を `/src/app` にする
-ENV PYTHONPATH=/src/app
-
-EXPOSE 8888
-
-CMD ["uvicorn", "api.app:app", "--host", "0.0.0.0", "--port", "8888"]
+    && rm -rf /root/.cache/pip
