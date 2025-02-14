@@ -1,6 +1,6 @@
 from fastapi import APIRouter
-from app.api.routes.auth import router as auth
-from app.api.routes.stock_price_prediction import router as stock_price_prediction
+from routes.auth import router as auth
+from routes.stock_price_prediction import router as stock_price_prediction
 
 
 router = APIRouter()

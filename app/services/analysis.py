@@ -91,7 +91,7 @@ def get_prediction(code):
     """
     try :
         # 企業情報を取得
-        company = yf.Ticker(code_+".T")
+        company = yf.Ticker(code+".T")
     except Exception as e :
         error_message = "企業データが存在しません、銘柄コードを確認してください"
         raise HTTPException(status_code=500, detail=error_message)
