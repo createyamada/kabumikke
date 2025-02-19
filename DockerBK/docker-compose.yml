@@ -4,7 +4,7 @@ services:
       context: .
       dockerfile: Dockerfile
     volumes:
-      - ./src/:/src/
-    command: uvicorn app.api.app:app --reload --workers 1 --host 0.0.0.0 --port 8888
+      - ./app/:/app/
+    command: uvicorn app:app --reload --workers 1 --host 0.0.0.0 --port 8888
     ports:
       - 8888:8888

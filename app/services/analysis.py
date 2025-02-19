@@ -34,7 +34,7 @@ def get_analysis_data(company):
 
     # 日経平均株価を取得する
     nikkei = yf.Ticker("^N225")
-    nikkei_info = nikkei.history(period="max")
+    nikkei_info = nikkei.history(period="max",prepost=True,actions=False)
     nikkei_info = nikkei_info[["Open", "Close"]]
     nikkei_info = nikkei_info.rename(columns={'Open': 'nikkei_open','Close': 'nikkei_close' })
     result.append(nikkei_info)
@@ -187,13 +187,19 @@ def price_predict(divided_datas):
     df = pd.DataFrame(divided_datas['X_test'])
 
     # 最終行の説明変数を取得
-    last_data = divided_datas['last_data']
+    last_data = divided_datas['last_data'].values.reshape(1,-1)
     tomorrow_prediction = model.predict(last_data)[0]
 
     # 翌営業日の日付を取得
-    next_business_day = get_next_weekday(str(result.index[-1].strftime('%Y-%m-%d')))
+    next_business_day = get_next_weekday(str(divided_datas['last_data'].name.strftime('%Y-%m-%d')))
 
-    # データフレームに新しい行を追加
+    # 最新日のデータを追加
+    last_row = pd.DataFrame({
+        'Close_next': divided_datas['last_data']["Close"],
+        'Close_pred': divided_datas['last_data']["Close"],
+    }, index=[str(divided_datas['last_data'].name.strftime('%Y-%m-%d'))])
+
+    # 予想の年月日のデータを追加
     new_row = pd.DataFrame({
         'Close_next': [0],
         'Close_pred': [tomorrow_prediction],
@@ -203,6 +209,7 @@ def price_predict(divided_datas):
     result.index = result.index.strftime('%Y-%m-%d')
 
     # 行を追加
+    result = pd.concat([result, last_row])
     result = pd.concat([result, new_row])
 
     return {

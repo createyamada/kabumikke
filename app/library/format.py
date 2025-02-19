@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta
 from library import config
 
@@ -80,15 +81,18 @@ def get_divided_data(data):
     dates = get_divided_date(data.index.tolist(), 365)
 
     if pd.isna(data[config.EXPLANATORY_VARIABLES_ANALYSIS].iloc[-1]["dow_open"]):
-        data.loc[data.index[-1], 'dow_open'] = data.iloc[-1]["mini_dow_open"]
-        data.loc[data.index[-1], 'dow_close'] = data.iloc[-1]["mini_dow_close"]
+        if np.isnan(data.iloc[-1]["mini_dow_open"]):
+            data.loc[data.index[-1], 'dow_open'] = data.iloc[-2]["dow_open"]
+            data.loc[data.index[-1], 'dow_close'] = data.iloc[-2]["dow_open"]
+        else:
+            data.loc[data.index[-1], 'dow_open'] = data.iloc[-1]["mini_dow_open"]
+            data.loc[data.index[-1], 'dow_close'] = data.iloc[-1]["mini_dow_close"]
 
-    last_data = data[config.EXPLANATORY_VARIABLES_ANALYSIS].iloc[-1].values.reshape(1, -1)
+    last_data = data[config.EXPLANATORY_VARIABLES_ANALYSIS].iloc[-1].drop(columns=['Close_next'])
 
     # それぞれデータを作成
     train = data[config.EXPLANATORY_VARIABLES][dates['start']: dates['start_end']].dropna(how="any")
     test = data[config.EXPLANATORY_VARIABLES][dates['end_start']:].dropna(how="any")
-
 
     # 学習用データとテストデータそれぞれを説明変数と目的変数に分離する
     X_train = train.drop(columns=['Close_next'])
@@ -96,12 +100,14 @@ def get_divided_data(data):
     X_test = test.drop(columns=['Close_next'])
     Y_test = pd.DataFrame(test['Close_next'], columns=['Close_next'])
 
+
+
     return {
         'X_train': X_train,
         'Y_train': Y_train,
         'X_test': X_test,
         'Y_test': Y_test,
-        'last_data': data[config.EXPLANATORY_VARIABLES_ANALYSIS].iloc[-1].values.reshape(1, -1),
+        'last_data': last_data,
     }
 
 def get_divided_date(data, days):
