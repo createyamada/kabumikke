@@ -12,11 +12,40 @@ from sklearn.metrics import mean_squared_error as mse
 import numpy as np
 import pandas as pd
 import re
+import logging
 from datetime import datetime
 from datetime import timedelta
 from library import format
 from library import config
 import yfinance as yf
+
+
+logger = logging.getLogger(__name__)
+HISTORY_PERIOD = "10y"
+
+
+def fetch_history(ticker, label, required=True, **kwargs):
+    """yfinanceの一時的な取得失敗を1回だけ再試行する。"""
+    last_error = None
+    for attempt in range(2):
+        try:
+            history = ticker.history(period=HISTORY_PERIOD, **kwargs)
+            if history is not None and not history.empty:
+                return history
+            last_error = RuntimeError(f"{label}の履歴が空です。")
+        except Exception as error:
+            last_error = error
+            logger.warning(
+                "market data fetch failed: label=%s attempt=%s",
+                label,
+                attempt + 1,
+                exc_info=True,
+            )
+
+    if required:
+        raise RuntimeError(f"{label}の市場データを取得できませんでした。") from last_error
+    logger.warning("optional market data unavailable: label=%s", label)
+    return pd.DataFrame()
 
 
 def get_analysis_data(company):
@@ -32,22 +61,20 @@ def get_analysis_data(company):
     result = []
 
     # 企業の株価時系列。空のまま市場指標だけを分析しないよう先に検証する。
-    company_history = company.history(period="max")
-    if company_history.empty:
-        raise ValueError("指定された銘柄の株価データが見つかりません。")
+    company_history = fetch_history(company, "company")
     result.append(company_history)
 
 
     # 日経平均株価を取得する
     nikkei = yf.Ticker("^N225")
-    nikkei_info = nikkei.history(period="max",prepost=True,actions=False)
+    nikkei_info = fetch_history(nikkei, "nikkei", prepost=True, actions=False)
     nikkei_info = nikkei_info[["Open", "Close"]]
     nikkei_info = nikkei_info.rename(columns={'Open': 'nikkei_open','Close': 'nikkei_close' })
     result.append(nikkei_info)
 
     # ドル円を取得する
     jpy = yf.Ticker("JPY=X")
-    jpy_info = jpy.history(period="max",prepost=True,actions=False )
+    jpy_info = fetch_history(jpy, "jpy", prepost=True, actions=False)
     jpy_info = jpy_info[["Open", "Close"]]
     jpy_info = jpy_info.rename(columns={'Open': 'jpy_open','Close': 'jpy_close' })
     result.append(jpy_info)
@@ -55,16 +82,17 @@ def get_analysis_data(company):
 
     # ニューヨークダウ平均株価を取得する
     dow = yf.Ticker("^DJI")
-    dow_info = dow.history(period="max")
+    dow_info = fetch_history(dow, "dow", actions=False)
     dow_info = dow_info[["Open", "Close"]]
     dow_info = dow_info.rename(columns={'Open': 'dow_open','Close': 'dow_close' })
     result.append(dow_info)
 
     mini_dow = yf.Ticker("YM=F")
-    mini_dow_info = mini_dow.history(period="max")
-    mini_dow_info = mini_dow_info[["Open", "Close"]]
-    mini_dow_info = mini_dow_info.rename(columns={'Open': 'mini_dow_open','Close': 'mini_dow_close' })
-    result.append(mini_dow_info)
+    mini_dow_info = fetch_history(mini_dow, "mini_dow", required=False, actions=False)
+    if not mini_dow_info.empty:
+        mini_dow_info = mini_dow_info[["Open", "Close"]]
+        mini_dow_info = mini_dow_info.rename(columns={'Open': 'mini_dow_open','Close': 'mini_dow_close' })
+        result.append(mini_dow_info)
     
 
     # # 財務諸表直近四年分
@@ -109,6 +137,7 @@ def get_prediction(code):
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
     except Exception as e:
+        logger.exception("stock analysis failed: code=%s", code)
         raise HTTPException(
             status_code=503,
             detail="株価データの取得または分析に失敗しました。時間をおいて再度試してください。",

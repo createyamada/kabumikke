@@ -77,7 +77,7 @@ sys.modules.setdefault("sklearn.pipeline", pipeline)
 sys.modules.setdefault("sklearn.preprocessing", preprocessing)
 
 from library import config, format  # noqa: E402
-from services.analysis import get_next_weekday, price_predict  # noqa: E402
+from services.analysis import fetch_history, get_next_weekday, price_predict  # noqa: E402
 
 
 class StockAnalysisTest(unittest.TestCase):
@@ -114,6 +114,24 @@ class StockAnalysisTest(unittest.TestCase):
 
     def test_next_weekday_skips_weekend(self):
         self.assertEqual(get_next_weekday("2026-08-07"), "2026-08-10")
+
+    def test_market_data_fetch_retries_once(self):
+        expected = pd.DataFrame({"Close": [100.0]})
+
+        class TemporaryFailureTicker:
+            attempts = 0
+
+            def history(self, **kwargs):
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise RuntimeError("temporary failure")
+                return expected
+
+        ticker = TemporaryFailureTicker()
+        actual = fetch_history(ticker, "test")
+
+        self.assertEqual(ticker.attempts, 2)
+        self.assertTrue(actual.equals(expected))
 
 
 if __name__ == "__main__":
