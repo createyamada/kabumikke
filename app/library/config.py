@@ -21,25 +21,29 @@ EXPLANATORY_VARIABLES = [
 
 # 予測に使用する説明変数
 EXPLANATORY_VARIABLES_ANALYSIS = [
-    'High',
-    'Low',
-    'Open',
-    'Close',
-    'Body',
-    'Close_diff',
-    'SMA5',
-    'SMA25',
-    'SMA70',
-    'Volume',
-    'nikkei_open',
-    'nikkei_close',
-    'dow_open',
-    'dow_close',
-    'jpy_open',
-    'jpy_close',
+    'return_1d',
+    'return_5d',
+    'return_20d',
+    'intraday_return',
+    'sma5_gap',
+    'sma25_gap',
+    'sma70_gap',
+    'rsi14',
+    'macd',
+    'atr14_rate',
+    'bollinger_position',
+    'volatility20',
+    'volume_change',
+    'volume_ratio20',
+    'nikkei_return',
+    'dow_return',
+    'jpy_return',
 ]
 
 # 目的変数として取得するデータ名の配列
 OBJECT_VARIABLES = [
-    'Close_next'
+    'target_return'
 ]
+
+# バックテストで片道売買時に控除する概算コスト（10bp）。
+TRANSACTION_COST_RATE = 0.001

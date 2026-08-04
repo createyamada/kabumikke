@@ -43,6 +43,13 @@ def merge_all_company_info(infos: list):
     merged_df.set_index(keys='Date', inplace=True)
     merged_df.sort_values(by='Date', ascending=True, inplace=True)
 
+    # 米国市場の当日値が未確定なら先物で補い、それもなければ直近値を使用する。
+    if pd.isna(merged_df.iloc[-1]['dow_open']):
+        if pd.notna(merged_df.iloc[-1].get('mini_dow_open')):
+            merged_df.loc[merged_df.index[-1], 'dow_open'] = merged_df.iloc[-1]['mini_dow_open']
+            merged_df.loc[merged_df.index[-1], 'dow_close'] = merged_df.iloc[-1]['mini_dow_close']
+    merged_df[['dow_open', 'dow_close']] = merged_df[['dow_open', 'dow_close']].ffill()
+
     merged_df['Body'] = (merged_df['Open'] - merged_df['Close']).fillna(0)
     merged_df['Close_diff'] = merged_df['Close'].diff(1).fillna(0)
     merged_df['Close_next'] = merged_df['Close'].shift(-1)
@@ -50,6 +57,44 @@ def merge_all_company_info(infos: list):
     merged_df['SMA5'] = merged_df['Close'].rolling(5, min_periods=1).mean()
     merged_df['SMA25'] = merged_df['Close'].rolling(25, min_periods=1).mean()
     merged_df['SMA70'] = merged_df['Close'].rolling(70, min_periods=1).mean()
+
+    # 価格水準ではなく、銘柄や相場局面をまたいで比較できる比率を特徴量にする。
+    merged_df['return_1d'] = merged_df['Close'].pct_change()
+    merged_df['return_5d'] = merged_df['Close'].pct_change(5)
+    merged_df['return_20d'] = merged_df['Close'].pct_change(20)
+    merged_df['intraday_return'] = merged_df['Close'] / merged_df['Open'] - 1
+    merged_df['sma5_gap'] = merged_df['Close'] / merged_df['SMA5'] - 1
+    merged_df['sma25_gap'] = merged_df['Close'] / merged_df['SMA25'] - 1
+    merged_df['sma70_gap'] = merged_df['Close'] / merged_df['SMA70'] - 1
+
+    close_delta = merged_df['Close'].diff()
+    average_gain = close_delta.clip(lower=0).rolling(14).mean()
+    average_loss = -close_delta.clip(upper=0).rolling(14).mean()
+    relative_strength = average_gain / average_loss.replace(0, np.nan)
+    merged_df['rsi14'] = (100 - 100 / (1 + relative_strength)).fillna(50) / 100
+
+    ema12 = merged_df['Close'].ewm(span=12, adjust=False).mean()
+    ema26 = merged_df['Close'].ewm(span=26, adjust=False).mean()
+    merged_df['macd'] = (ema12 - ema26) / merged_df['Close']
+
+    previous_close = merged_df['Close'].shift(1)
+    true_range = pd.concat([
+        merged_df['High'] - merged_df['Low'],
+        (merged_df['High'] - previous_close).abs(),
+        (merged_df['Low'] - previous_close).abs(),
+    ], axis=1).max(axis=1)
+    merged_df['atr14_rate'] = true_range.rolling(14).mean() / merged_df['Close']
+
+    rolling_std = merged_df['Close'].rolling(20).std()
+    merged_df['bollinger_position'] = (
+        (merged_df['Close'] - merged_df['SMA25']) / (2 * rolling_std.replace(0, np.nan))
+    )
+    merged_df['volatility20'] = merged_df['return_1d'].rolling(20).std()
+    merged_df['volume_change'] = merged_df['Volume'].pct_change()
+    merged_df['volume_ratio20'] = merged_df['Volume'] / merged_df['Volume'].rolling(20).mean() - 1
+    merged_df['nikkei_return'] = merged_df['nikkei_close'].pct_change()
+    merged_df['dow_return'] = merged_df['dow_close'].pct_change()
+    merged_df['jpy_return'] = merged_df['jpy_close'].pct_change()
     # 配列に含まれる列名のみを抽出
     # merged_df = merged_df[config.EXPLANATORY_VARIABLES]
     return merged_df
@@ -78,29 +123,42 @@ def get_divided_data(data):
     Returns:
     - result {学習用,検証用}
     """
-    dates = get_divided_date(data.index.tolist(), 365)
+    if data.empty:
+        raise ValueError("分析対象の株価データがありません。")
 
-    if pd.isna(data[config.EXPLANATORY_VARIABLES_ANALYSIS].iloc[-1]["dow_open"]):
-        if np.isnan(data.iloc[-1]["mini_dow_open"]):
-            data.loc[data.index[-1], 'dow_open'] = data.iloc[-2]["dow_open"]
-            data.loc[data.index[-1], 'dow_close'] = data.iloc[-2]["dow_open"]
-        else:
-            data.loc[data.index[-1], 'dow_open'] = data.iloc[-1]["mini_dow_open"]
-            data.loc[data.index[-1], 'dow_close'] = data.iloc[-1]["mini_dow_close"]
+    data = data.copy().sort_index()
+    features = config.EXPLANATORY_VARIABLES_ANALYSIS
+    required_columns = set(features + ['Close', 'Close_next'])
+    missing_columns = sorted(required_columns.difference(data.columns))
+    if missing_columns:
+        raise ValueError(f"分析に必要な列がありません: {', '.join(missing_columns)}")
 
-    last_data = data[config.EXPLANATORY_VARIABLES_ANALYSIS].iloc[-1].drop(columns=['Close_next'])
+    feature_data = data[features].replace([np.inf, -np.inf], np.nan).ffill()
+    last_data = feature_data.iloc[-1]
+    if last_data.isna().any():
+        missing = ', '.join(last_data.index[last_data.isna()].tolist())
+        raise ValueError(f"最新日の説明変数を補完できません: {missing}")
 
-    # それぞれデータを作成
-    train = data[config.EXPLANATORY_VARIABLES][dates['start']: dates['start_end']].dropna(how="any")
-    test = data[config.EXPLANATORY_VARIABLES][dates['end_start']:].dropna(how="any")
+    target_return = data['Close_next'] / data['Close'] - 1
+    labeled = pd.concat([
+        feature_data,
+        target_return.rename('target_return'),
+        data['Close_next'],
+    ], axis=1).dropna(how="any")
+    if len(labeled) < 50:
+        raise ValueError("分析に必要な履歴が不足しています（50営業日以上必要です）。")
 
-    # 学習用データとテストデータそれぞれを説明変数と目的変数に分離する
-    X_train = train.drop(columns=['Close_next'])
-    Y_train = train['Close_next']
-    X_test = test.drop(columns=['Close_next'])
-    Y_test = pd.DataFrame(test['Close_next'], columns=['Close_next'])
+    # 最長約1年、かつ全体の20%をホールドアウトして時系列順に評価する。
+    test_size = min(252, max(20, len(labeled) // 5))
+    if len(labeled) - test_size < 30:
+        test_size = len(labeled) - 30
+    train = labeled.iloc[:-test_size]
+    test = labeled.iloc[-test_size:]
 
-
+    X_train = train[features]
+    Y_train = train['target_return']
+    X_test = test[features]
+    Y_test = test['target_return']
 
     return {
         'X_train': X_train,
@@ -108,6 +166,11 @@ def get_divided_data(data):
         'X_test': X_test,
         'Y_test': Y_test,
         'last_data': last_data,
+        'X_all': labeled[features],
+        'Y_all': labeled['target_return'],
+        'actual_close_test': test['Close_next'],
+        'current_close_test': data.loc[test.index, 'Close'],
+        'last_close': float(data.iloc[-1]['Close']),
     }
 
 def get_divided_date(data, days):

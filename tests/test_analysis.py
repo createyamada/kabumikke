@@ -1,0 +1,120 @@
+import sys
+import types
+import unittest
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+
+APP_DIR = Path(__file__).resolve().parents[1] / "app"
+sys.path.insert(0, str(APP_DIR))
+
+# 分析の純粋な計算部分だけをテストするため、外部API依存を軽量な代替にする。
+fastapi = types.ModuleType("fastapi")
+
+
+class HTTPException(Exception):
+    def __init__(self, status_code, detail):
+        self.status_code = status_code
+        self.detail = detail
+
+
+fastapi.HTTPException = HTTPException
+sys.modules.setdefault("fastapi", fastapi)
+sys.modules.setdefault("yfinance", types.ModuleType("yfinance"))
+
+sklearn = types.ModuleType("sklearn")
+linear_model = types.ModuleType("sklearn.linear_model")
+model_selection = types.ModuleType("sklearn.model_selection")
+metrics = types.ModuleType("sklearn.metrics")
+ensemble = types.ModuleType("sklearn.ensemble")
+pipeline = types.ModuleType("sklearn.pipeline")
+preprocessing = types.ModuleType("sklearn.preprocessing")
+
+
+class LinearRegression:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def fit(self, features, target):
+        matrix = np.column_stack([np.ones(len(features)), np.asarray(features)])
+        self.coefficients = np.linalg.lstsq(matrix, np.asarray(target), rcond=None)[0]
+        return self
+
+    def predict(self, features):
+        matrix = np.column_stack([np.ones(len(features)), np.asarray(features)])
+        return matrix @ self.coefficients
+
+
+class TimeSeriesSplit:
+    def __init__(self, n_splits):
+        self.n_splits = n_splits
+
+    def split(self, features):
+        fold_size = len(features) // (self.n_splits + 1)
+        for fold in range(self.n_splits):
+            train_end = fold_size * (fold + 1)
+            valid_end = min(train_end + fold_size, len(features))
+            yield np.arange(train_end), np.arange(train_end, valid_end)
+
+
+linear_model.LinearRegression = LinearRegression
+linear_model.Ridge = LinearRegression
+ensemble.HistGradientBoostingRegressor = LinearRegression
+model_selection.TimeSeriesSplit = TimeSeriesSplit
+metrics.mean_squared_error = lambda actual, predicted: np.mean(
+    (np.asarray(actual) - np.asarray(predicted)) ** 2
+)
+pipeline.make_pipeline = lambda *steps: steps[-1]
+preprocessing.StandardScaler = object
+sys.modules.setdefault("sklearn", sklearn)
+sys.modules.setdefault("sklearn.linear_model", linear_model)
+sys.modules.setdefault("sklearn.model_selection", model_selection)
+sys.modules.setdefault("sklearn.metrics", metrics)
+sys.modules.setdefault("sklearn.ensemble", ensemble)
+sys.modules.setdefault("sklearn.pipeline", pipeline)
+sys.modules.setdefault("sklearn.preprocessing", preprocessing)
+
+from library import config, format  # noqa: E402
+from services.analysis import get_next_weekday, price_predict  # noqa: E402
+
+
+class StockAnalysisTest(unittest.TestCase):
+    def make_data(self, rows=320):
+        index = pd.bdate_range("2024-01-01", periods=rows)
+        close = pd.Series(100 + np.arange(rows) * 0.2, index=index)
+        data = pd.DataFrame(index=index)
+        for offset, column in enumerate(config.EXPLANATORY_VARIABLES_ANALYSIS):
+            data[column] = close + offset * 0.01
+        data["Close"] = close
+        data["Close_next"] = close.shift(-1)
+        return data
+
+    def test_division_preserves_order_and_provides_full_training_set(self):
+        divided = format.get_divided_data(self.make_data())
+
+        self.assertLess(divided["X_train"].index.max(), divided["X_test"].index.min())
+        self.assertEqual(len(divided["X_all"]), 319)
+        self.assertEqual(list(divided["last_data"].index), config.EXPLANATORY_VARIABLES_ANALYSIS)
+        expected_return = 0.2 / 100
+        self.assertAlmostEqual(divided["Y_all"].iloc[0], expected_return)
+
+    def test_prediction_retrains_and_returns_comparison_metrics(self):
+        divided = format.get_divided_data(self.make_data())
+        result = price_predict(divided)
+
+        self.assertIn("baseline_return_rmse", result["metrics"])
+        self.assertIn("directional_accuracy", result["metrics"])
+        self.assertEqual(result["score"], result["metrics"]["rmse"])
+        self.assertGreater(result["metrics"]["training_samples"], result["metrics"]["test_samples"])
+        self.assertIn(result["selected_model"], result["model_comparison"])
+        self.assertIn("strategy_return", result["backtest"])
+        self.assertLess(result["prediction_interval"]["lower_price"], result["prediction_interval"]["upper_price"])
+
+    def test_next_weekday_skips_weekend(self):
+        self.assertEqual(get_next_weekday("2026-08-07"), "2026-08-10")
+
+
+if __name__ == "__main__":
+    unittest.main()
