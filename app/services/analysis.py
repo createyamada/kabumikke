@@ -73,6 +73,14 @@ def get_analysis_data(company):
     nikkei_info = nikkei_info.rename(columns={'Open': 'nikkei_open','Close': 'nikkei_close' })
     result.append(nikkei_info)
 
+    # 東証全体の地合いを表すTOPIX。取得失敗時は後段で日経平均を代理にする。
+    topix = yf.Ticker("^TOPX")
+    topix_info = fetch_history(topix, "topix", required=False, prepost=True, actions=False)
+    if not topix_info.empty:
+        topix_info = topix_info[["Open", "Close"]]
+        topix_info = topix_info.rename(columns={"Open": "topix_open", "Close": "topix_close"})
+        result.append(topix_info)
+
     # ドル円を取得する
     jpy = yf.Ticker("JPY=X")
     jpy_info = fetch_history(jpy, "jpy", prepost=True, actions=False)
@@ -301,6 +309,115 @@ def analyze_topology(divided_datas, window=252, dimension=3, delay=1):
     }
 
 
+def estimate_up_probability(predicted_return, residuals):
+    """検証期間の誤差分布から、実現収益率が0を超える経験確率を求める。"""
+    errors = np.asarray(residuals, dtype=float)
+    errors = errors[np.isfinite(errors)]
+    if not len(errors):
+        return 0.5
+    # actual = prediction + residual とみなし、ラプラス補正で0/1への張り付きを防ぐ。
+    favorable = np.count_nonzero(errors > -float(predicted_return))
+    return float((favorable + 1) / (len(errors) + 2))
+
+
+def predict_multiple_horizons(divided_datas, columns, horizons=(5, 20)):
+    """同じ特徴量から5・20営業日先の収益率と上昇確率を時系列検証付きで返す。"""
+    source = divided_datas.get('source_data')
+    features = divided_datas.get('feature_data')
+    if source is None or features is None:
+        return {}
+
+    forecasts = {}
+    latest_features = features.iloc[-1][columns].to_frame().T
+    for horizon in horizons:
+        target = source['Close'].shift(-horizon) / source['Close'] - 1
+        labeled = pd.concat([features[columns], target.rename('target')], axis=1).dropna()
+        if len(labeled) < 80:
+            continue
+        test_size = min(252, max(20, len(labeled) // 5))
+        # 予測期間分を境界から除外し、学習ラベルが評価期間へはみ出す未来情報混入を防ぐ。
+        train_end = len(labeled) - test_size - horizon
+        if train_end < 40:
+            continue
+        train = labeled.iloc[:train_end]
+        test = labeled.iloc[-test_size:]
+        selected, comparison = compare_models_walk_forward(train, train['target'], columns)
+        model = get_candidate_models()[selected]()
+        model.fit(train[columns], train['target'])
+        holdout_prediction = model.predict(test[columns])
+        residuals = test['target'].to_numpy() - holdout_prediction
+        final_model = get_candidate_models()[selected]()
+        final_model.fit(labeled[columns], labeled['target'])
+        predicted_return = float(final_model.predict(latest_features)[0])
+        forecasts[str(horizon)] = {
+            'horizon_business_days': int(horizon),
+            'predicted_return': predicted_return,
+            'predicted_price': float(divided_datas['last_close'] * (1 + predicted_return)),
+            'up_probability': estimate_up_probability(predicted_return, residuals),
+            'selected_model': selected,
+            'holdout_return_rmse': float(np.sqrt(mse(test['target'], holdout_prediction))),
+            'walk_forward_return_rmse': float(comparison[selected]['walk_forward_rmse']),
+        }
+    return forecasts
+
+
+def build_confidence_assessment(metrics, comparison, selected_model, backtest, topology, horizon_predictions):
+    """予測精度・運用成績・相場構造を0～100点に統合する説明可能な判定。"""
+    reasons = []
+    score = 100
+    improvement = metrics['rmse_improvement_rate']
+    direction = metrics['directional_accuracy']
+    selected = comparison[selected_model]
+    walk_forward = max(selected['walk_forward_rmse'], 1e-12)
+    stability_ratio = selected['holdout_rmse'] / walk_forward
+
+    if improvement < 0.05:
+        score -= 20
+        reasons.append('ベースライン比較改善率が5%未満')
+    if direction < 0.55:
+        score -= 20
+        reasons.append('方向一致率が55%未満')
+    if stability_ratio > 1.25:
+        score -= 20
+        reasons.append('直近データのRMSEがウォークフォワードRMSEから乖離')
+    if backtest['sharpe_ratio'] < 1.0:
+        score -= 15
+        reasons.append('シャープレシオが1未満')
+    if backtest['strategy_return'] <= backtest['buy_and_hold_return']:
+        score -= 15
+        reasons.append('戦略リターンが買い持ちリターン以下')
+    if topology['regime'] == 'high_topological_complexity':
+        score -= 20
+        reasons.append('TDAが高トポロジー複雑度を検出')
+    elif topology['regime'] == 'moderate_topological_complexity':
+        score -= 5
+        reasons.append('TDAが中程度の市場複雑度を検出')
+
+    directions = [np.sign(item['predicted_return']) for item in horizon_predictions.values()]
+    if directions and len(set(directions)) > 1:
+        score -= 10
+        reasons.append('予測期間によって上昇・下落方向が一致しない')
+
+    score = int(max(0, min(100, score)))
+    level = '高' if score >= 75 else '中' if score >= 50 else '低'
+    signal = '候補' if score >= 75 else '監視' if score >= 50 else '見送り'
+    return {
+        'confidence_score': score,
+        'confidence_level': level,
+        'trade_signal': signal,
+        'risk_reasons': reasons,
+        'holdout_to_walk_forward_rmse_ratio': float(stability_ratio),
+        'criteria': {
+            'rmse_improvement_rate_min': 0.05,
+            'directional_accuracy_min': 0.55,
+            'rmse_stability_ratio_max': 1.25,
+            'sharpe_ratio_min': 1.0,
+            'strategy_must_beat_buy_and_hold': True,
+            'high_topological_complexity_allowed': False,
+        },
+    }
+
+
 def price_predict(divided_datas):
     """
     重回帰分析により予測する
@@ -404,6 +521,46 @@ def price_predict(divided_datas):
     result = pd.concat([result, last_row])
     result = pd.concat([result, new_row])
 
+    backtest = calculate_backtest(actual, Y_pred)
+    topology = analyze_topology(divided_datas)
+    up_probability = estimate_up_probability(tomorrow_return, residuals)
+    horizon_predictions = {
+        '1': {
+            'horizon_business_days': 1,
+            'predicted_return': tomorrow_return,
+            'predicted_price': float(tomorrow_prediction),
+            'up_probability': up_probability,
+            'selected_model': selected_model,
+            'holdout_return_rmse': float(return_score),
+            'walk_forward_return_rmse': float(model_comparison[selected_model]['walk_forward_rmse']),
+        }
+    }
+    horizon_predictions.update(
+        predict_multiple_horizons(divided_datas, available_columns, horizons=(5, 20))
+    )
+    metrics = {
+        'rmse': float(price_score),
+        'mae': float(price_mae),
+        'baseline_rmse': float(baseline_price_score),
+        'return_rmse': float(return_score),
+        'return_mae': float(return_mae),
+        'baseline_return_rmse': float(baseline_score),
+        'rmse_improvement_rate': (
+            float(1 - return_score / baseline_score) if baseline_score else 0.0
+        ),
+        'directional_accuracy': float(directional_accuracy),
+        'test_samples': int(len(actual)),
+        'training_samples': int(len(divided_datas['Y_all'])),
+    }
+    confidence = build_confidence_assessment(
+        metrics,
+        model_comparison,
+        selected_model,
+        backtest,
+        topology,
+        horizon_predictions,
+    )
+
     return {
         'close_next': result['Close_next'].to_dict(),
         'close_pred': result['Close_pred'].to_dict(),
@@ -412,24 +569,14 @@ def price_predict(divided_datas):
         'target': 'next_day_return',
         'selected_model': selected_model,
         'predicted_return': tomorrow_return,
+        'up_probability': up_probability,
+        'horizon_predictions': horizon_predictions,
+        'confidence': confidence,
         'prediction_interval': prediction_interval,
         'model_comparison': model_comparison,
-        'backtest': calculate_backtest(actual, Y_pred),
-        'topological_analysis': analyze_topology(divided_datas),
-        'metrics': {
-            'rmse': float(price_score),
-            'mae': float(price_mae),
-            'baseline_rmse': float(baseline_price_score),
-            'return_rmse': float(return_score),
-            'return_mae': float(return_mae),
-            'baseline_return_rmse': float(baseline_score),
-            'rmse_improvement_rate': (
-                float(1 - return_score / baseline_score) if baseline_score else 0.0
-            ),
-            'directional_accuracy': float(directional_accuracy),
-            'test_samples': int(len(actual)),
-            'training_samples': int(len(divided_datas['Y_all'])),
-        },
+        'backtest': backtest,
+        'topological_analysis': topology,
+        'metrics': metrics,
     }
 
 

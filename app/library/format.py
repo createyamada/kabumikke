@@ -93,6 +93,11 @@ def merge_all_company_info(infos: list):
     merged_df['volume_change'] = merged_df['Volume'].pct_change()
     merged_df['volume_ratio20'] = merged_df['Volume'] / merged_df['Volume'].rolling(20).mean() - 1
     merged_df['nikkei_return'] = merged_df['nikkei_close'].pct_change()
+    # TOPIXが取得できない日は日経平均の変化率を市場代理値として利用する。
+    if 'topix_close' in merged_df.columns:
+        merged_df['topix_return'] = merged_df['topix_close'].pct_change()
+    else:
+        merged_df['topix_return'] = merged_df['nikkei_return']
     merged_df['dow_return'] = merged_df['dow_close'].pct_change()
     merged_df['jpy_return'] = merged_df['jpy_close'].pct_change()
     # 配列に含まれる列名のみを抽出
@@ -171,6 +176,9 @@ def get_divided_data(data):
         'actual_close_test': test['Close_next'],
         'current_close_test': data.loc[test.index, 'Close'],
         'last_close': float(data.iloc[-1]['Close']),
+        # 複数予測期間の教師データを作るための内部データ。APIには直接返さない。
+        'source_data': data,
+        'feature_data': feature_data,
     }
 
 def get_divided_date(data, days):

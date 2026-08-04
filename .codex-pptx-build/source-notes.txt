@@ -1,0 +1,12 @@
+Communication job: By the end, beginner investors should understand how to read the displayed prediction, validation, backtest, and TDA metrics together, because no single number is a sufficient investment signal.
+
+Sources:
+- User-provided screenshot screen-forecast.png
+- User-provided screenshot screen-model.png
+- User-provided screenshot screen-tda.png
+- https://github.com/createyamada/kabunseki_web/blob/master/src/components/Main/Analysis.tsx
+- Backend scoring thresholds discussed and implemented in the current workspace
+
+Notes:
+- Thresholds such as 5% improvement, 55% directional accuracy, and 1.25x RMSE divergence are educational heuristics, not guarantees.
+- TDA regime is a risk/complexity filter, not a directional price forecast.

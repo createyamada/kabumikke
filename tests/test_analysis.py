@@ -125,6 +125,13 @@ class StockAnalysisTest(unittest.TestCase):
         self.assertGreater(result["metrics"]["training_samples"], result["metrics"]["test_samples"])
         self.assertIn(result["selected_model"], result["model_comparison"])
         self.assertIn("strategy_return", result["backtest"])
+        self.assertIn("up_probability", result)
+        self.assertGreaterEqual(result["up_probability"], 0.0)
+        self.assertLessEqual(result["up_probability"], 1.0)
+        self.assertEqual(set(result["horizon_predictions"]), {"1", "5", "20"})
+        self.assertIn(result["confidence"]["confidence_level"], {"高", "中", "低"})
+        self.assertIn(result["confidence"]["trade_signal"], {"候補", "監視", "見送り"})
+        self.assertIn("holdout_to_walk_forward_rmse_ratio", result["confidence"])
         self.assertLess(result["prediction_interval"]["lower_price"], result["prediction_interval"]["upper_price"])
         self.assertEqual(
             result["topological_analysis"]["method"],

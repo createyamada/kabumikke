@@ -36,6 +36,7 @@ EXPLANATORY_VARIABLES_ANALYSIS = [
     'volume_change',
     'volume_ratio20',
     'nikkei_return',
+    'topix_return',
     'dow_return',
     'jpy_return',
 ]
