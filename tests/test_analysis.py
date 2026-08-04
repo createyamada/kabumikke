@@ -24,6 +24,15 @@ fastapi.HTTPException = HTTPException
 sys.modules.setdefault("fastapi", fastapi)
 sys.modules.setdefault("yfinance", types.ModuleType("yfinance"))
 
+ripser_module = types.ModuleType("ripser")
+ripser_module.ripser = lambda points, maxdim=1: {
+    "dgms": [
+        np.array([[0.0, 0.4], [0.0, 0.8], [0.0, np.inf]]),
+        np.array([[0.2, 0.5], [0.3, 0.9]]),
+    ]
+}
+sys.modules.setdefault("ripser", ripser_module)
+
 sklearn = types.ModuleType("sklearn")
 linear_model = types.ModuleType("sklearn.linear_model")
 model_selection = types.ModuleType("sklearn.model_selection")
@@ -77,7 +86,13 @@ sys.modules.setdefault("sklearn.pipeline", pipeline)
 sys.modules.setdefault("sklearn.preprocessing", preprocessing)
 
 from library import config, format  # noqa: E402
-from services.analysis import fetch_history, get_next_weekday, price_predict  # noqa: E402
+from services.analysis import (  # noqa: E402
+    analyze_topology,
+    create_delay_embedding,
+    fetch_history,
+    get_next_weekday,
+    price_predict,
+)
 
 
 class StockAnalysisTest(unittest.TestCase):
@@ -111,6 +126,17 @@ class StockAnalysisTest(unittest.TestCase):
         self.assertIn(result["selected_model"], result["model_comparison"])
         self.assertIn("strategy_return", result["backtest"])
         self.assertLess(result["prediction_interval"]["lower_price"], result["prediction_interval"]["upper_price"])
+        self.assertEqual(
+            result["topological_analysis"]["method"],
+            "vietoris_rips_persistent_homology",
+        )
+        self.assertGreater(result["topological_analysis"]["h1_loops"]["feature_count"], 0)
+
+    def test_delay_embedding_has_requested_dimension(self):
+        points = create_delay_embedding(np.arange(50), dimension=3, delay=2)
+
+        self.assertEqual(points.shape, (46, 3))
+        self.assertTrue(np.allclose(points.mean(axis=0), 0.0))
 
     def test_next_weekday_skips_weekend(self):
         self.assertEqual(get_next_weekday("2026-08-07"), "2026-08-10")

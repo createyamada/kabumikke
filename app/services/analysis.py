@@ -9,6 +9,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit
 # 予測精度検証のためMSEをインポート
 from sklearn.metrics import mean_squared_error as mse
+from ripser import ripser
 import numpy as np
 import pandas as pd
 import re
@@ -218,6 +219,88 @@ def calculate_backtest(actual_returns, predicted_returns):
     }
 
 
+def create_delay_embedding(values, dimension=3, delay=1):
+    """1次元の時系列をTakens型の遅延座標へ埋め込む。"""
+    series = np.asarray(values, dtype=float)
+    series = series[np.isfinite(series)]
+    required = (dimension - 1) * delay + 1
+    if len(series) < max(40, required):
+        raise ValueError("トポロジカル分析に必要な履歴が不足しています。")
+
+    point_count = len(series) - (dimension - 1) * delay
+    point_cloud = np.column_stack([
+        series[offset * delay:offset * delay + point_count]
+        for offset in range(dimension)
+    ])
+    mean = point_cloud.mean(axis=0)
+    standard_deviation = point_cloud.std(axis=0)
+    standard_deviation[standard_deviation == 0] = 1.0
+    return (point_cloud - mean) / standard_deviation
+
+
+def summarize_persistence_diagram(diagram):
+    """永続図をJSON化しやすい集約指標へ変換する。"""
+    intervals = np.asarray(diagram, dtype=float)
+    if intervals.size == 0:
+        lifetimes = np.array([], dtype=float)
+    else:
+        finite = intervals[np.isfinite(intervals[:, 1])]
+        lifetimes = finite[:, 1] - finite[:, 0]
+        lifetimes = lifetimes[lifetimes > 1e-9]
+
+    total = float(lifetimes.sum())
+    if total:
+        probabilities = lifetimes / total
+        entropy = float(-np.sum(probabilities * np.log(probabilities)))
+    else:
+        entropy = 0.0
+
+    return {
+        'feature_count': int(len(lifetimes)),
+        'total_persistence': total,
+        'max_persistence': float(lifetimes.max()) if len(lifetimes) else 0.0,
+        'mean_persistence': float(lifetimes.mean()) if len(lifetimes) else 0.0,
+        'persistence_entropy': entropy,
+    }
+
+
+def analyze_topology(divided_datas, window=252, dimension=3, delay=1):
+    """株価リターン点群のH0/H1パーシステントホモロジーを集約する。"""
+    returns = divided_datas['X_all']['return_1d'].tail(window).to_numpy()
+    latest_return = divided_datas['last_data'].get('return_1d')
+    if pd.notna(latest_return):
+        returns = np.r_[returns, float(latest_return)][-window:]
+
+    point_cloud = create_delay_embedding(returns, dimension=dimension, delay=delay)
+    diagrams = ripser(point_cloud, maxdim=1)['dgms']
+    h0 = summarize_persistence_diagram(diagrams[0])
+    h1 = summarize_persistence_diagram(diagrams[1])
+
+    # H0に対するH1の永続量比を、市場構造の複雑さを示す補助指標として扱う。
+    loop_strength = h1['total_persistence'] / max(h0['total_persistence'], 1e-12)
+    if loop_strength < 0.05:
+        regime = 'low_topological_complexity'
+    elif loop_strength < 0.15:
+        regime = 'moderate_topological_complexity'
+    else:
+        regime = 'high_topological_complexity'
+
+    return {
+        'method': 'vietoris_rips_persistent_homology',
+        'role': 'market_structure_indicator_not_price_forecast',
+        'source': 'daily_return_delay_embedding',
+        'sample_size': int(len(returns)),
+        'point_count': int(len(point_cloud)),
+        'embedding_dimension': int(dimension),
+        'delay': int(delay),
+        'h0_connected_components': h0,
+        'h1_loops': h1,
+        'loop_strength': float(loop_strength),
+        'regime': regime,
+        'interpretation': 'heuristic',
+    }
+
+
 def price_predict(divided_datas):
     """
     重回帰分析により予測する
@@ -332,6 +415,7 @@ def price_predict(divided_datas):
         'prediction_interval': prediction_interval,
         'model_comparison': model_comparison,
         'backtest': calculate_backtest(actual, Y_pred),
+        'topological_analysis': analyze_topology(divided_datas),
         'metrics': {
             'rmse': float(price_score),
             'mae': float(price_mae),

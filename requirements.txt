@@ -6,6 +6,7 @@ python-jose
 python-multipart
 python-dotenv
 scikit-learn
+ripser==0.6.15
 requests
 passlib
 yfinance
