@@ -40,6 +40,7 @@ metrics = types.ModuleType("sklearn.metrics")
 ensemble = types.ModuleType("sklearn.ensemble")
 pipeline = types.ModuleType("sklearn.pipeline")
 preprocessing = types.ModuleType("sklearn.preprocessing")
+isotonic = types.ModuleType("sklearn.isotonic")
 
 
 class LinearRegression:
@@ -55,21 +56,42 @@ class LinearRegression:
         matrix = np.column_stack([np.ones(len(features)), np.asarray(features)])
         return matrix @ self.coefficients
 
+    def predict_proba(self, features):
+        score = np.clip(self.predict(features), -20, 20)
+        probability = 1 / (1 + np.exp(-score))
+        return np.column_stack([1 - probability, probability])
+
+
+class IsotonicRegression:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def fit(self, values, labels):
+        self.minimum = float(np.min(values))
+        self.maximum = float(np.max(values))
+        return self
+
+    def predict(self, values):
+        return np.clip(np.asarray(values, dtype=float), 0, 1)
+
 
 class TimeSeriesSplit:
-    def __init__(self, n_splits):
+    def __init__(self, n_splits, gap=0):
         self.n_splits = n_splits
+        self.gap = gap
 
     def split(self, features):
         fold_size = len(features) // (self.n_splits + 1)
         for fold in range(self.n_splits):
             train_end = fold_size * (fold + 1)
             valid_end = min(train_end + fold_size, len(features))
-            yield np.arange(train_end), np.arange(train_end, valid_end)
+            purged_train_end = max(1, train_end - self.gap)
+            yield np.arange(purged_train_end), np.arange(train_end, valid_end)
 
 
 linear_model.LinearRegression = LinearRegression
 linear_model.Ridge = LinearRegression
+linear_model.LogisticRegression = LinearRegression
 ensemble.HistGradientBoostingRegressor = LinearRegression
 model_selection.TimeSeriesSplit = TimeSeriesSplit
 metrics.mean_squared_error = lambda actual, predicted: np.mean(
@@ -77,6 +99,7 @@ metrics.mean_squared_error = lambda actual, predicted: np.mean(
 )
 pipeline.make_pipeline = lambda *steps: steps[-1]
 preprocessing.StandardScaler = object
+isotonic.IsotonicRegression = IsotonicRegression
 sys.modules.setdefault("sklearn", sklearn)
 sys.modules.setdefault("sklearn.linear_model", linear_model)
 sys.modules.setdefault("sklearn.model_selection", model_selection)
@@ -84,6 +107,7 @@ sys.modules.setdefault("sklearn.metrics", metrics)
 sys.modules.setdefault("sklearn.ensemble", ensemble)
 sys.modules.setdefault("sklearn.pipeline", pipeline)
 sys.modules.setdefault("sklearn.preprocessing", preprocessing)
+sys.modules.setdefault("sklearn.isotonic", isotonic)
 
 from library import config, format  # noqa: E402
 from services.analysis import (  # noqa: E402
@@ -126,18 +150,36 @@ class StockAnalysisTest(unittest.TestCase):
         self.assertIn(result["selected_model"], result["model_comparison"])
         self.assertIn("strategy_return", result["backtest"])
         self.assertIn("up_probability", result)
+        self.assertIn("direction_classifier", result)
+        self.assertIn("return_risk", result)
+        self.assertIn("topix_excess_return_prediction", result)
+        self.assertTrue(result["topix_excess_return_prediction"]["available"])
+        self.assertIn("industry_relative_strength", result)
         self.assertGreaterEqual(result["up_probability"], 0.0)
         self.assertLessEqual(result["up_probability"], 1.0)
         self.assertEqual(set(result["horizon_predictions"]), {"1", "5", "20"})
         self.assertIn(result["confidence"]["confidence_level"], {"高", "中", "低"})
         self.assertIn(result["confidence"]["trade_signal"], {"候補", "監視", "見送り"})
         self.assertIn("holdout_to_walk_forward_rmse_ratio", result["confidence"])
+        self.assertEqual(result["confidence"]["score_type"], "heuristic_analysis_health")
+        self.assertFalse(result["confidence"]["statistical_confidence"])
+        self.assertIn("brier_score", result["probability_evaluation"])
+        self.assertIn("actual_coverage", result["interval_evaluation"])
+        self.assertEqual(
+            result["prediction_interval"]["method"],
+            "adaptive_conformal_asymmetric_residual",
+        )
+        self.assertEqual(result["backtest"]["execution_lag_business_days"], 1)
+        self.assertIn("sortino_ratio", result["backtest"])
         self.assertLess(result["prediction_interval"]["lower_price"], result["prediction_interval"]["upper_price"])
         self.assertEqual(
             result["topological_analysis"]["method"],
             "vietoris_rips_persistent_homology",
         )
         self.assertGreater(result["topological_analysis"]["h1_loops"]["feature_count"], 0)
+        self.assertFalse(result["topological_analysis"]["included_in_health_score"])
+        self.assertEqual(set(result["topological_analysis_multi_window"]["windows"]), {"60", "120", "252"})
+        self.assertEqual(result["data_quality"]["us_market_lag_business_days"], 1)
 
     def test_delay_embedding_has_requested_dimension(self):
         points = create_delay_embedding(np.arange(50), dimension=3, delay=2)

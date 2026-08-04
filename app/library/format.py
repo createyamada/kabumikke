@@ -100,6 +100,19 @@ def merge_all_company_info(infos: list):
         merged_df['topix_return'] = merged_df['nikkei_return']
     merged_df['dow_return'] = merged_df['dow_close'].pct_change()
     merged_df['jpy_return'] = merged_df['jpy_close'].pct_change()
+    if 'sector_close' in merged_df.columns:
+        merged_df['sector_return'] = merged_df['sector_close'].pct_change()
+        merged_df['sector_relative_strength_20d'] = (
+            (1 + merged_df['return_1d']).rolling(20).apply(np.prod, raw=True)
+            / (1 + merged_df['sector_return']).rolling(20).apply(np.prod, raw=True) - 1
+        )
+        merged_df['sector_benchmark_source'] = 'topix_17_etf'
+    else:
+        merged_df['sector_return'] = merged_df['topix_return']
+        merged_df['sector_relative_strength_20d'] = merged_df['return_20d'] - (
+            (1 + merged_df['topix_return']).rolling(20).apply(np.prod, raw=True) - 1
+        )
+        merged_df['sector_benchmark_source'] = 'topix_fallback'
     # 配列に含まれる列名のみを抽出
     # merged_df = merged_df[config.EXPLANATORY_VARIABLES]
     return merged_df

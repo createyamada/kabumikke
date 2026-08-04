@@ -2,6 +2,8 @@ from fastapi import HTTPException
 # 線形回帰モデルのLinearRegressionをインポート
 from sklearn.linear_model import LinearRegression
 from sklearn.linear_model import Ridge
+from sklearn.linear_model import LogisticRegression
+from sklearn.isotonic import IsotonicRegression
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -18,11 +20,37 @@ from datetime import datetime
 from datetime import timedelta
 from library import format
 from library import config
+from services import edinet
 import yfinance as yf
 
 
 logger = logging.getLogger(__name__)
 HISTORY_PERIOD = "10y"
+
+SECTOR_ETF_BY_KEYWORD = {
+    'food': '1617.T', 'energy': '1618.T', 'oil': '1618.T',
+    'construction': '1619.T', 'material': '1620.T', 'chemical': '1620.T',
+    'pharma': '1621.T', 'healthcare': '1621.T', 'automotive': '1622.T',
+    'transportation equipment': '1622.T', 'steel': '1623.T', 'metal': '1623.T',
+    'machinery': '1624.T', 'electronic': '1625.T', 'semiconductor': '1625.T',
+    'technology': '1626.T', 'communication': '1626.T', 'utilities': '1627.T',
+    'transportation': '1628.T', 'logistics': '1628.T', 'trading': '1629.T',
+    'wholesale': '1629.T', 'retail': '1630.T', 'bank': '1631.T',
+    'financial': '1632.T', 'insurance': '1632.T', 'real estate': '1633.T',
+}
+
+
+def resolve_sector_benchmark(company):
+    """Yahooの業種説明からTOPIX-17連動ETFを選び、業種ベンチマークにする。"""
+    try:
+        info = company.info or {}
+    except Exception:
+        return None, None
+    description = ' '.join(str(info.get(key, '')).lower() for key in ('sector', 'industry', 'sectorKey', 'industryKey'))
+    for keyword, symbol in SECTOR_ETF_BY_KEYWORD.items():
+        if keyword in description:
+            return symbol, info.get('industry') or info.get('sector')
+    return None, info.get('industry') or info.get('sector')
 
 
 def fetch_history(ticker, label, required=True, **kwargs):
@@ -79,7 +107,15 @@ def get_analysis_data(company):
     if not topix_info.empty:
         topix_info = topix_info[["Open", "Close"]]
         topix_info = topix_info.rename(columns={"Open": "topix_open", "Close": "topix_close"})
-        result.append(topix_info)
+    result.append(topix_info)
+
+    sector_symbol, sector_name = resolve_sector_benchmark(company)
+    if sector_symbol:
+        sector = yf.Ticker(sector_symbol)
+        sector_info = fetch_history(sector, "sector_benchmark", required=False, actions=False)
+        if not sector_info.empty:
+            sector_info = sector_info[["Close"]].rename(columns={"Close": "sector_close"})
+            result.append(sector_info)
 
     # ドル円を取得する
     jpy = yf.Ticker("JPY=X")
@@ -117,7 +153,10 @@ def get_analysis_data(company):
     # result.append(company.quarterly_balance_sheet)
 
     # 個別のデータフレームを1つのデータフレームにまとめデータを整形する
-    return format.merge_all_company_info(result)
+    merged = format.merge_all_company_info(result)
+    merged.attrs['sector_benchmark_symbol'] = sector_symbol
+    merged.attrs['sector_name'] = sector_name
+    return merged
 
 
 def get_prediction(code):
@@ -143,6 +182,15 @@ def get_prediction(code):
         # 分析に必要な学習用、検証用データに分ける
         divided_datas = format.get_divided_data(datas)
         price_prediction = price_predict(divided_datas)
+        try:
+            price_prediction['fundamental_analysis'] = edinet.get_fundamental_analysis(code)
+        except Exception:
+            logger.warning("EDINET analysis unavailable: code=%s", code, exc_info=True)
+            price_prediction['fundamental_analysis'] = {
+                'available': False,
+                'source': 'EDINET_API_v2',
+                'reason': 'temporary_fetch_or_parse_error',
+            }
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
     except Exception as e:
@@ -179,10 +227,10 @@ def get_candidate_models():
     }
 
 
-def compare_models_walk_forward(features, target, columns):
-    """過去から未来へ進む交差検証でモデルを比較する。"""
+def compare_models_walk_forward(features, target, columns, horizon=1):
+    """目的期間分をpurgeしたウォークフォワード検証でモデルを比較する。"""
     split_count = min(5, max(2, len(features) // 60))
-    splitter = TimeSeriesSplit(n_splits=split_count)
+    splitter = TimeSeriesSplit(n_splits=split_count, gap=max(1, int(horizon)))
     comparison = {}
 
     for name, factory in get_candidate_models().items():
@@ -195,6 +243,7 @@ def compare_models_walk_forward(features, target, columns):
         comparison[name] = {
             'walk_forward_rmse': float(np.mean(fold_scores)),
             'fold_scores': fold_scores,
+            'purge_gap_business_days': int(horizon),
         }
 
     selected_name = min(comparison, key=lambda name: comparison[name]['walk_forward_rmse'])
@@ -202,28 +251,49 @@ def compare_models_walk_forward(features, target, columns):
 
 
 def calculate_backtest(actual_returns, predicted_returns):
-    """ロング・現金戦略を、売買コスト込みで評価する。"""
+    """シグナルを1営業日遅延させ、コストとスリッページ込みで評価する。"""
     actual = np.asarray(actual_returns, dtype=float)
     predicted = np.asarray(predicted_returns, dtype=float)
-    # 期待収益が片道コストを上回る場合だけ保有する。
-    position = (predicted > config.TRANSACTION_COST_RATE).astype(float)
+    total_one_way_cost = config.TRANSACTION_COST_RATE + config.SLIPPAGE_RATE
+    raw_signal = (predicted > total_one_way_cost).astype(float)
+    # 終値確定後に生成したシグナルは、次の観測期間から有効にする。
+    position = np.r_[0.0, raw_signal[:-1]]
     trades = np.abs(np.diff(np.r_[0.0, position]))
-    strategy_returns = position * actual - trades * config.TRANSACTION_COST_RATE
+    gross_strategy_returns = position * actual
+    strategy_returns = gross_strategy_returns - trades * total_one_way_cost
     strategy_curve = np.cumprod(1 + strategy_returns)
+    gross_strategy_curve = np.cumprod(1 + gross_strategy_returns)
     buy_hold_curve = np.cumprod(1 + actual)
     running_peak = np.maximum.accumulate(strategy_curve)
     drawdown = strategy_curve / running_peak - 1
     volatility = np.std(strategy_returns, ddof=1)
     sharpe = np.sqrt(252) * np.mean(strategy_returns) / volatility if volatility else 0.0
+    downside = strategy_returns[strategy_returns < 0]
+    downside_volatility = np.std(downside, ddof=1) if len(downside) > 1 else 0.0
+    sortino = (
+        np.sqrt(252) * np.mean(strategy_returns) / downside_volatility
+        if downside_volatility else 0.0
+    )
+    annualized_return = float(strategy_curve[-1] ** (252 / len(strategy_returns)) - 1)
+    max_drawdown = float(np.min(drawdown))
+    calmar = annualized_return / abs(max_drawdown) if max_drawdown else 0.0
 
     return {
         'strategy_return': float(strategy_curve[-1] - 1),
+        'gross_strategy_return': float(gross_strategy_curve[-1] - 1),
         'buy_and_hold_return': float(buy_hold_curve[-1] - 1),
         'sharpe_ratio': float(sharpe),
-        'max_drawdown': float(np.min(drawdown)),
+        'sortino_ratio': float(sortino),
+        'calmar_ratio': float(calmar),
+        'annualized_return': annualized_return,
+        'max_drawdown': max_drawdown,
         'trade_count': int(np.count_nonzero(trades)),
+        'turnover': float(trades.sum()),
         'transaction_cost_rate': float(config.TRANSACTION_COST_RATE),
-        'signal_threshold': float(config.TRANSACTION_COST_RATE),
+        'slippage_rate': float(config.SLIPPAGE_RATE),
+        'total_estimated_cost': float(np.sum(trades) * total_one_way_cost),
+        'signal_threshold': float(total_one_way_cost),
+        'execution_lag_business_days': 1,
     }
 
 
@@ -306,6 +376,71 @@ def analyze_topology(divided_datas, window=252, dimension=3, delay=1):
         'loop_strength': float(loop_strength),
         'regime': regime,
         'interpretation': 'heuristic',
+        'predictive_validation': 'not_evaluated',
+        'included_in_health_score': False,
+    }
+
+
+def analyze_topology_multi_window(divided_datas, windows=(60, 120, 252)):
+    """複数期間のTDAと、直前窓からの複雑度変化を返す。"""
+    results = {}
+    for window in windows:
+        try:
+            current = analyze_topology(divided_datas, window=window)
+            source = divided_datas['X_all'].iloc[:-max(10, window // 5)]
+            previous_data = dict(divided_datas)
+            previous_data['X_all'] = source
+            previous_data['last_data'] = source.iloc[-1]
+            previous = analyze_topology(previous_data, window=window)
+            current['previous_loop_strength'] = previous['loop_strength']
+            current['loop_strength_change'] = float(current['loop_strength'] - previous['loop_strength'])
+            current['loop_strength_change_rate'] = float(
+                current['loop_strength'] / max(previous['loop_strength'], 1e-12) - 1
+            )
+            results[str(window)] = current
+        except (ValueError, IndexError):
+            continue
+    available = list(results.values())
+    return {
+        'windows': results,
+        'trend': (
+            'increasing_complexity' if available and np.mean([x['loop_strength_change'] for x in available]) > 0
+            else 'decreasing_or_stable_complexity'
+        ),
+        'mean_loop_strength_change': float(np.mean([x['loop_strength_change'] for x in available])) if available else None,
+    }
+
+
+def predict_topix_excess_return(divided_datas, columns):
+    """翌営業日の銘柄収益率－TOPIX収益率を独立した予測対象として学習する。"""
+    source = divided_datas.get('source_data')
+    features = divided_datas.get('feature_data')
+    if source is None or features is None or 'topix_return' not in source:
+        return {'available': False, 'reason': 'topix_data_unavailable'}
+    stock_next = source['Close'].shift(-1) / source['Close'] - 1
+    topix_next = source['topix_return'].shift(-1)
+    labeled = pd.concat([features[columns], (stock_next - topix_next).rename('target')], axis=1).dropna()
+    if len(labeled) < 80:
+        return {'available': False, 'reason': 'insufficient_samples'}
+    test_size = min(252, max(20, len(labeled) // 5))
+    train = labeled.iloc[:-test_size]
+    test = labeled.iloc[-test_size:]
+    selected, comparison = compare_models_walk_forward(train, train['target'], columns, horizon=1)
+    model = get_candidate_models()[selected]()
+    model.fit(train[columns], train['target'])
+    holdout = model.predict(test[columns])
+    final_model = get_candidate_models()[selected]()
+    final_model.fit(labeled[columns], labeled['target'])
+    prediction = float(final_model.predict(features.iloc[-1][columns].to_frame().T)[0])
+    actual = test['target'].to_numpy()
+    return {
+        'available': True,
+        'target': 'next_day_stock_return_minus_topix_return',
+        'predicted_excess_return': prediction,
+        'selected_model': selected,
+        'holdout_rmse': float(np.sqrt(mse(actual, holdout))),
+        'directional_accuracy': float(np.mean(np.sign(actual) == np.sign(holdout))),
+        'up_probability': estimate_up_probability(prediction, actual - holdout),
     }
 
 
@@ -318,6 +453,168 @@ def estimate_up_probability(predicted_return, residuals):
     # actual = prediction + residual とみなし、ラプラス補正で0/1への張り付きを防ぐ。
     favorable = np.count_nonzero(errors > -float(predicted_return))
     return float((favorable + 1) / (len(errors) + 2))
+
+
+def evaluate_probability_calibration(actual_returns, predicted_returns, minimum_history=20):
+    """過去の残差だけで逐次確率を作り、確率予測の校正状態を評価する。"""
+    actual = np.asarray(actual_returns, dtype=float)
+    predicted = np.asarray(predicted_returns, dtype=float)
+    residuals = actual - predicted
+    probabilities = []
+    outcomes = []
+    for index in range(minimum_history, len(actual)):
+        probabilities.append(estimate_up_probability(predicted[index], residuals[:index]))
+        outcomes.append(float(actual[index] > 0))
+
+    if not probabilities:
+        return {
+            'method': 'expanding_residual_empirical_calibration',
+            'sample_size': 0,
+            'brier_score': None,
+            'log_loss': None,
+            'bins': [],
+        }
+
+    probabilities = np.asarray(probabilities)
+    outcomes = np.asarray(outcomes)
+    clipped = np.clip(probabilities, 1e-6, 1 - 1e-6)
+    bins = []
+    boundaries = np.linspace(0, 1, 6)
+    for lower, upper in zip(boundaries[:-1], boundaries[1:]):
+        mask = (probabilities >= lower) & (
+            probabilities <= upper if upper == 1 else probabilities < upper
+        )
+        if np.any(mask):
+            bins.append({
+                'lower': float(lower),
+                'upper': float(upper),
+                'count': int(mask.sum()),
+                'mean_predicted_probability': float(probabilities[mask].mean()),
+                'observed_up_rate': float(outcomes[mask].mean()),
+            })
+
+    return {
+        'method': 'expanding_residual_empirical_calibration',
+        'sample_size': int(len(outcomes)),
+        'brier_score': float(np.mean((probabilities - outcomes) ** 2)),
+        'log_loss': float(-np.mean(outcomes * np.log(clipped) + (1 - outcomes) * np.log(1 - clipped))),
+        'bins': bins,
+    }
+
+
+def train_calibrated_direction_classifier(X_train, y_train, X_test, y_test, last_data):
+    """上昇専用ロジスティック分類器を、時系列順のIsotonic回帰で確率校正する。"""
+    labels = (np.asarray(y_train) > 0).astype(int)
+    if len(labels) < 60 or len(np.unique(labels)) < 2:
+        return {'available': False, 'reason': 'insufficient_class_variation'}
+    calibration_size = max(20, len(labels) // 5)
+    fit_end = len(labels) - calibration_size
+    if fit_end < 30 or len(np.unique(labels[:fit_end])) < 2:
+        return {'available': False, 'reason': 'insufficient_training_samples'}
+
+    classifier = make_pipeline(
+        StandardScaler(),
+        LogisticRegression(max_iter=1000, class_weight='balanced', random_state=42),
+    )
+    classifier.fit(X_train.iloc[:fit_end], labels[:fit_end])
+    raw_calibration = classifier.predict_proba(X_train.iloc[fit_end:])[:, 1]
+    calibrator = IsotonicRegression(out_of_bounds='clip')
+    calibrator.fit(raw_calibration, labels[fit_end:])
+    raw_test = classifier.predict_proba(X_test)[:, 1]
+    calibrated_test = np.asarray(calibrator.predict(raw_test), dtype=float)
+    outcomes = (np.asarray(y_test) > 0).astype(float)
+    last_raw = float(classifier.predict_proba(last_data)[0, 1])
+    last_probability = float(calibrator.predict([last_raw])[0])
+    clipped = np.clip(calibrated_test, 1e-6, 1 - 1e-6)
+    return {
+        'available': True,
+        'model': 'logistic_regression',
+        'calibration_method': 'isotonic_time_ordered_holdout',
+        'up_probability': last_probability,
+        'raw_up_probability': last_raw,
+        'brier_score': float(np.mean((calibrated_test - outcomes) ** 2)),
+        'log_loss': float(-np.mean(outcomes * np.log(clipped) + (1 - outcomes) * np.log(1 - clipped))),
+        'directional_accuracy': float(np.mean((calibrated_test >= 0.5) == outcomes)),
+        'test_samples': int(len(outcomes)),
+    }
+
+
+def calculate_return_risk(predicted_return, residuals, transaction_cost=None):
+    """予測分布から期待値、損失確率、平均上下幅、リスクリワード比を算出する。"""
+    cost = (config.TRANSACTION_COST_RATE + config.SLIPPAGE_RATE) if transaction_cost is None else transaction_cost
+    errors = np.asarray(residuals, dtype=float)
+    distribution = float(predicted_return) + errors[np.isfinite(errors)]
+    if not len(distribution):
+        return {'available': False}
+    gains = distribution[distribution > 0]
+    losses = distribution[distribution <= 0]
+    mean_gain = float(gains.mean()) if len(gains) else 0.0
+    mean_loss = float(abs(losses.mean())) if len(losses) else 0.0
+    return {
+        'available': True,
+        'expected_return_after_cost': float(distribution.mean() - cost),
+        'loss_probability': float(np.mean(distribution <= 0)),
+        'gain_probability': float(np.mean(distribution > 0)),
+        'average_gain': mean_gain,
+        'average_loss': mean_loss,
+        'reward_risk_ratio': float(mean_gain / mean_loss) if mean_loss else None,
+        'expected_shortfall_10pct': float(np.mean(distribution[distribution <= np.quantile(distribution, 0.10)])),
+        'distribution_quantiles': {
+            key: float(np.quantile(distribution, quantile))
+            for key, quantile in [('p10', 0.10), ('p25', 0.25), ('p50', 0.50), ('p75', 0.75), ('p90', 0.90)]
+        },
+    }
+
+
+def build_adaptive_prediction_interval(
+    actual_returns,
+    predicted_returns,
+    next_predicted_return,
+    latest_close,
+    target_coverage=config.PREDICTION_INTERVAL_COVERAGE,
+    learning_rate=config.ADAPTIVE_CONFORMAL_LEARNING_RATE,
+    minimum_history=20,
+):
+    """過去時点で利用可能な残差だけを使う適応的な非対称予測区間。"""
+    actual = np.asarray(actual_returns, dtype=float)
+    predicted = np.asarray(predicted_returns, dtype=float)
+    residuals = actual - predicted
+    alpha = 1 - target_coverage
+    covered = []
+    widths = []
+
+    for index in range(minimum_history, len(actual)):
+        history = residuals[:index]
+        lower_error = float(np.quantile(history, alpha / 2))
+        upper_error = float(np.quantile(history, 1 - alpha / 2))
+        lower = predicted[index] + lower_error
+        upper = predicted[index] + upper_error
+        is_covered = lower <= actual[index] <= upper
+        covered.append(is_covered)
+        widths.append(upper - lower)
+        error = 0.0 if is_covered else 1.0
+        alpha = float(np.clip(alpha + learning_rate * ((1 - target_coverage) - error), 0.02, 0.50))
+
+    lower_error = float(np.quantile(residuals, alpha / 2))
+    upper_error = float(np.quantile(residuals, 1 - alpha / 2))
+    lower_return = float(next_predicted_return + lower_error)
+    upper_return = float(next_predicted_return + upper_error)
+    interval = {
+        'confidence': float(target_coverage),
+        'method': 'adaptive_conformal_asymmetric_residual',
+        'lower_return': lower_return,
+        'upper_return': upper_return,
+        'lower_price': float(latest_close * (1 + lower_return)),
+        'upper_price': float(latest_close * (1 + upper_return)),
+    }
+    evaluation = {
+        'target_coverage': float(target_coverage),
+        'actual_coverage': float(np.mean(covered)) if covered else None,
+        'evaluation_samples': int(len(covered)),
+        'average_return_width': float(np.mean(widths)) if widths else None,
+        'current_adaptive_alpha': float(alpha),
+    }
+    return interval, evaluation
 
 
 def predict_multiple_horizons(divided_datas, columns, horizons=(5, 20)):
@@ -341,7 +638,12 @@ def predict_multiple_horizons(divided_datas, columns, horizons=(5, 20)):
             continue
         train = labeled.iloc[:train_end]
         test = labeled.iloc[-test_size:]
-        selected, comparison = compare_models_walk_forward(train, train['target'], columns)
+        selected, comparison = compare_models_walk_forward(
+            train,
+            train['target'],
+            columns,
+            horizon=horizon,
+        )
         model = get_candidate_models()[selected]()
         model.fit(train[columns], train['target'])
         holdout_prediction = model.predict(test[columns])
@@ -361,8 +663,16 @@ def predict_multiple_horizons(divided_datas, columns, horizons=(5, 20)):
     return forecasts
 
 
-def build_confidence_assessment(metrics, comparison, selected_model, backtest, topology, horizon_predictions):
-    """予測精度・運用成績・相場構造を0～100点に統合する説明可能な判定。"""
+def build_confidence_assessment(
+    metrics,
+    comparison,
+    selected_model,
+    backtest,
+    horizon_predictions,
+    probability_evaluation,
+    interval_evaluation,
+):
+    """検証済み指標を0～100点にまとめた分析健全性のヒューリスティック判定。"""
     reasons = []
     score = 100
     improvement = metrics['rmse_improvement_rate']
@@ -386,12 +696,16 @@ def build_confidence_assessment(metrics, comparison, selected_model, backtest, t
     if backtest['strategy_return'] <= backtest['buy_and_hold_return']:
         score -= 15
         reasons.append('戦略リターンが買い持ちリターン以下')
-    if topology['regime'] == 'high_topological_complexity':
-        score -= 20
-        reasons.append('TDAが高トポロジー複雑度を検出')
-    elif topology['regime'] == 'moderate_topological_complexity':
-        score -= 5
-        reasons.append('TDAが中程度の市場複雑度を検出')
+    brier_score = probability_evaluation.get('brier_score')
+    if brier_score is not None and brier_score > 0.25:
+        score -= 10
+        reasons.append('上昇確率のBrier scoreが0.25を超過')
+
+    actual_coverage = interval_evaluation.get('actual_coverage')
+    target_coverage = interval_evaluation.get('target_coverage')
+    if actual_coverage is not None and actual_coverage < target_coverage - 0.05:
+        score -= 10
+        reasons.append('予測区間の実被覆率が目標を5ポイント以上下回る')
 
     directions = [np.sign(item['predicted_return']) for item in horizon_predictions.values()]
     if directions and len(set(directions)) > 1:
@@ -402,6 +716,8 @@ def build_confidence_assessment(metrics, comparison, selected_model, backtest, t
     level = '高' if score >= 75 else '中' if score >= 50 else '低'
     signal = '候補' if score >= 75 else '監視' if score >= 50 else '見送り'
     return {
+        'score_type': 'heuristic_analysis_health',
+        'statistical_confidence': False,
         'confidence_score': score,
         'confidence_level': level,
         'trade_signal': signal,
@@ -413,7 +729,8 @@ def build_confidence_assessment(metrics, comparison, selected_model, backtest, t
             'rmse_stability_ratio_max': 1.25,
             'sharpe_ratio_min': 1.0,
             'strategy_must_beat_buy_and_hold': True,
-            'high_topological_complexity_allowed': False,
+            'probability_brier_score_max': 0.25,
+            'prediction_interval_coverage_tolerance': 0.05,
         },
     }
 
@@ -438,6 +755,7 @@ def price_predict(divided_datas):
         divided_datas['X_train'],
         divided_datas['Y_train'],
         available_columns,
+        horizon=1,
     )
     evaluation_model = get_candidate_models()[selected_model]()
     evaluation_model.fit(
@@ -487,17 +805,14 @@ def price_predict(divided_datas):
     latest_close = divided_datas['last_close']
     tomorrow_prediction = latest_close * (1 + tomorrow_return)
 
-    # ホールドアウト残差から外れ値に頑健な80%予測区間を作る。
+    # ホールドアウト残差を使い、時系列に追従する予測区間を作る。
     residuals = actual.to_numpy() - Y_pred
-    lower_return = tomorrow_return + float(np.quantile(residuals, 0.10))
-    upper_return = tomorrow_return + float(np.quantile(residuals, 0.90))
-    prediction_interval = {
-        'confidence': 0.80,
-        'lower_return': lower_return,
-        'upper_return': upper_return,
-        'lower_price': latest_close * (1 + lower_return),
-        'upper_price': latest_close * (1 + upper_return),
-    }
+    prediction_interval, interval_evaluation = build_adaptive_prediction_interval(
+        actual,
+        Y_pred,
+        tomorrow_return,
+        latest_close,
+    )
 
     # 翌営業日の日付を取得
     next_business_day = get_next_weekday(str(divided_datas['last_data'].name.strftime('%Y-%m-%d')))
@@ -524,6 +839,17 @@ def price_predict(divided_datas):
     backtest = calculate_backtest(actual, Y_pred)
     topology = analyze_topology(divided_datas)
     up_probability = estimate_up_probability(tomorrow_return, residuals)
+    probability_evaluation = evaluate_probability_calibration(actual, Y_pred)
+    classifier_probability = train_calibrated_direction_classifier(
+        divided_datas['X_train'][available_columns],
+        divided_datas['Y_train'],
+        divided_datas['X_test'][available_columns],
+        divided_datas['Y_test'],
+        last_data,
+    )
+    if classifier_probability.get('available'):
+        up_probability = classifier_probability['up_probability']
+    return_risk = calculate_return_risk(tomorrow_return, residuals)
     horizon_predictions = {
         '1': {
             'horizon_business_days': 1,
@@ -557,9 +883,36 @@ def price_predict(divided_datas):
         model_comparison,
         selected_model,
         backtest,
-        topology,
         horizon_predictions,
+        probability_evaluation,
+        interval_evaluation,
     )
+    source_data = divided_datas.get('source_data')
+    excess_return_prediction = predict_topix_excess_return(divided_datas, available_columns)
+    topology_multi_window = analyze_topology_multi_window(divided_datas)
+    sector_source = (
+        str(source_data['sector_benchmark_source'].iloc[-1])
+        if source_data is not None and 'sector_benchmark_source' in source_data else None
+    )
+    industry_relative_strength = {
+        'available': bool(source_data is not None and 'sector_relative_strength_20d' in source_data),
+        'benchmark_symbol': source_data.attrs.get('sector_benchmark_symbol') if source_data is not None else None,
+        'sector_name': source_data.attrs.get('sector_name') if source_data is not None else None,
+        'benchmark_source': sector_source,
+        'relative_strength_20d': (
+            float(source_data['sector_relative_strength_20d'].iloc[-1])
+            if source_data is not None and 'sector_relative_strength_20d' in source_data else None
+        ),
+    }
+    data_quality = {
+        'point_in_time_policy': 'japan_close_forecast_origin',
+        'us_market_lag_business_days': 1,
+        'daily_fx_lag_business_days': 1,
+        'corporate_action_handling': 'yfinance_adjusted_history',
+        'history_start': str(source_data.index.min().date()) if source_data is not None else None,
+        'history_end': str(source_data.index.max().date()) if source_data is not None else None,
+        'history_rows': int(len(source_data)) if source_data is not None else 0,
+    }
 
     return {
         'close_next': result['Close_next'].to_dict(),
@@ -570,13 +923,21 @@ def price_predict(divided_datas):
         'selected_model': selected_model,
         'predicted_return': tomorrow_return,
         'up_probability': up_probability,
+        'direction_classifier': classifier_probability,
+        'return_risk': return_risk,
+        'topix_excess_return_prediction': excess_return_prediction,
+        'industry_relative_strength': industry_relative_strength,
         'horizon_predictions': horizon_predictions,
         'confidence': confidence,
+        'probability_evaluation': probability_evaluation,
         'prediction_interval': prediction_interval,
+        'interval_evaluation': interval_evaluation,
         'model_comparison': model_comparison,
         'backtest': backtest,
         'topological_analysis': topology,
+        'topological_analysis_multi_window': topology_multi_window,
         'metrics': metrics,
+        'data_quality': data_quality,
     }
 
 

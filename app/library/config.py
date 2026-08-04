@@ -37,6 +37,8 @@ EXPLANATORY_VARIABLES_ANALYSIS = [
     'volume_ratio20',
     'nikkei_return',
     'topix_return',
+    'sector_return',
+    'sector_relative_strength_20d',
     'dow_return',
     'jpy_return',
 ]
@@ -48,3 +50,10 @@ OBJECT_VARIABLES = [
 
 # バックテストで片道売買時に控除する概算コスト（10bp）。
 TRANSACTION_COST_RATE = 0.001
+
+# 終値確定後の発注が翌営業日に約定する際の概算スリッページ（5bp）。
+SLIPPAGE_RATE = 0.0005
+
+# 適応的予測区間の設定。
+PREDICTION_INTERVAL_COVERAGE = 0.80
+ADAPTIVE_CONFORMAL_LEARNING_RATE = 0.02
