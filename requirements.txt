@@ -3,6 +3,7 @@ uvicorn==0.13.3
 numpy
 pandas
 openpyxl
+xlrd>=2.0.1
 python-jose
 python-multipart
 python-dotenv

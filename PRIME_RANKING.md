@@ -8,6 +8,12 @@ JPXが公開する上場銘柄一覧からプライム内国普通株式を抽�
 PRIME_RANKING_DIR=data/prime_ranking
 ```
 
+JPXの一覧は月によって`.xls`または`.xlsx`で提供されるため、`requirements.txt`には`.xls`用の`xlrd`と`.xlsx`用の`openpyxl`を含めています。依存関係変更後は再インストールしてください。
+
+```powershell
+pip install -r requirements.txt
+```
+
 EDINET財務分析もランキングへ反映する場合は、`EDINET_API_KEY`も設定します。未設定でも株価・モデル・TDAによるランキングは生成できます。
 
 ## 更新開始
