@@ -2,6 +2,7 @@ fastapi==0.63.0
 uvicorn==0.13.3
 numpy
 pandas
+openpyxl
 python-jose
 python-multipart
 python-dotenv

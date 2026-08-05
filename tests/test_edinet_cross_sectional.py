@@ -1,4 +1,7 @@
 import sys
+import json
+import os
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -10,9 +13,43 @@ sys.path.insert(0, str(APP_DIR))
 
 from services.cross_sectional import run_cross_sectional_backtest  # noqa: E402
 from services.edinet import EdinetClient, extract_financial_metrics, get_fundamental_analysis, score_fundamentals  # noqa: E402
+from services.prime_ranking import atomic_replace_ranking, parse_prime_universe, read_latest_ranking  # noqa: E402
 
 
 class EdinetAndCrossSectionalTest(unittest.TestCase):
+    def test_jpx_prime_universe_excludes_other_markets(self):
+        source = pd.DataFrame({
+            "コード": ["58020", "12340", "99990"],
+            "銘柄名": ["A社", "B社", "ETF"],
+            "市場・商品区分": ["プライム（内国株式）", "スタンダード（内国株式）", "プライム（ETF）"],
+            "33業種区分": ["非鉄金属", "機械", "ETF"],
+        })
+        result = parse_prime_universe(source)
+        self.assertEqual(result["code"].tolist(), ["5802"])
+
+    def test_latest_ranking_is_atomically_replaced_and_read(self):
+        previous = os.environ.get("PRIME_RANKING_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                os.environ["PRIME_RANKING_DIR"] = directory
+                frame = pd.DataFrame({
+                    "rank": [1, 2], "code": ["5802", "6501"],
+                    "company": ["A社", "B社"], "total_score": [80.0, 70.0],
+                    "analyzed_at": ["2026-08-05T06:00:00+09:00"] * 2,
+                    "positive_factors": [json.dumps(["positive"])] * 2,
+                    "risk_factors": [json.dumps([])] * 2,
+                })
+                atomic_replace_ranking(frame)
+                result = read_latest_ranking(limit=1)
+                self.assertTrue(result["available"])
+                self.assertEqual(result["ranking"][0]["code"], "5802")
+                self.assertEqual(result["ranking"][0]["positive_factors"], ["positive"])
+        finally:
+            if previous is None:
+                os.environ.pop("PRIME_RANKING_DIR", None)
+            else:
+                os.environ["PRIME_RANKING_DIR"] = previous
+
     def test_edinet_csv_metrics_are_extracted(self):
         frame = pd.DataFrame({
             "要素ID": ["NetSales", "OperatingIncome", "Assets", "Equity"],
