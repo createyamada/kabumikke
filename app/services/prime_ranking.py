@@ -111,14 +111,17 @@ def fetch_prime_universe():
     return universe
 
 
-def _extract_field(downloaded, field):
+def _extract_field(downloaded, field, symbols=None):
     if isinstance(downloaded.columns, pd.MultiIndex):
         if field in downloaded.columns.get_level_values(0):
             return downloaded[field]
         if field in downloaded.columns.get_level_values(-1):
             return downloaded.xs(field, axis=1, level=-1)
     if field in downloaded.columns:
-        return downloaded[[field]]
+        result = downloaded[[field]].copy()
+        if symbols and len(symbols) == 1:
+            result.columns = [symbols[0]]
+        return result
     return pd.DataFrame(index=downloaded.index)
 
 
@@ -131,18 +134,29 @@ def download_market_matrices(codes, period="2y", chunk_size=100):
     for start in range(0, len(symbols), chunk_size):
         chunk = symbols[start:start + chunk_size]
         downloaded = yf.download(chunk, period=period, auto_adjust=True, progress=False, threads=True)
-        closes.append(_extract_field(downloaded, "Close"))
-        volumes.append(_extract_field(downloaded, "Volume"))
+        closes.append(_extract_field(downloaded, "Close", chunk))
+        volumes.append(_extract_field(downloaded, "Volume", chunk))
     close = pd.concat(closes, axis=1).loc[:, lambda x: ~x.columns.duplicated()]
     volume = pd.concat(volumes, axis=1).loc[:, lambda x: ~x.columns.duplicated()]
-    topix_download = yf.download("^TOPX", period=period, auto_adjust=True, progress=False)
-    topix = _extract_field(topix_download, "Close").iloc[:, 0]
+    topix = None
+    # Yahoo側でTOPIX指数が取得できない場合はTOPIX連動ETF（1306）へフォールバックする。
+    for benchmark_symbol in ("^TOPX", "1306.T"):
+        try:
+            topix_download = yf.download(benchmark_symbol, period=period, auto_adjust=True, progress=False)
+            topix_frame = _extract_field(topix_download, "Close", [benchmark_symbol])
+            if not topix_frame.empty and topix_frame.notna().any().any():
+                topix = topix_frame.iloc[:, 0].dropna()
+                break
+        except Exception:
+            continue
     return close, volume, topix
 
 
 def screen_prime_universe(universe, close, volume, topix):
     """全銘柄をベクトル演算し、高度分析候補をランキングする。"""
     close = close.ffill()
+    if close.empty or len(close) < 61:
+        raise ValueError("insufficient stock price data returned by yfinance")
     volume = volume.reindex_like(close).fillna(0)
     valid = close.notna().sum() >= 120
     close = close.loc[:, valid]
@@ -150,7 +164,13 @@ def screen_prime_universe(universe, close, volume, topix):
     latest = close.iloc[-1]
     return20 = close.pct_change(20).iloc[-1]
     return60 = close.pct_change(60).iloc[-1]
-    topix20 = float(topix.ffill().pct_change(20).iloc[-1])
+    if topix is not None and len(topix.dropna()) >= 21:
+        topix20 = float(topix.ffill().pct_change(20).dropna().iloc[-1])
+        benchmark_source = "TOPIX_or_1306"
+    else:
+        # 指数・ETFの両方が取れない場合でも停止せず、分析対象銘柄の中央値を市場代理値にする。
+        topix20 = float(return20.median())
+        benchmark_source = "prime_universe_median_fallback"
     excess20 = return20 - topix20
     volatility20 = close.pct_change().tail(20).std()
     average_turnover20 = (close * volume).tail(20).mean()
@@ -164,6 +184,7 @@ def screen_prime_universe(universe, close, volume, topix):
         "volatility_20d": volatility20.values,
         "average_turnover_20d": average_turnover20.values,
         "volume_ratio_20d": volume_ratio20.values,
+        "market_benchmark_source": benchmark_source,
     })
     table["code"] = table["symbol"].str.extract(r"(\d{4})", expand=False)
     table = table.merge(universe[["code", "company", "sector"]], on="code", how="inner")

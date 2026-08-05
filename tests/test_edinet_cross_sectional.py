@@ -13,7 +13,7 @@ sys.path.insert(0, str(APP_DIR))
 
 from services.cross_sectional import run_cross_sectional_backtest  # noqa: E402
 from services.edinet import EdinetClient, extract_financial_metrics, get_fundamental_analysis, score_fundamentals  # noqa: E402
-from services.prime_ranking import atomic_replace_ranking, parse_prime_universe, read_latest_ranking  # noqa: E402
+from services.prime_ranking import atomic_replace_ranking, parse_prime_universe, read_latest_ranking, screen_prime_universe  # noqa: E402
 
 
 class EdinetAndCrossSectionalTest(unittest.TestCase):
@@ -49,6 +49,20 @@ class EdinetAndCrossSectionalTest(unittest.TestCase):
                 os.environ.pop("PRIME_RANKING_DIR", None)
             else:
                 os.environ["PRIME_RANKING_DIR"] = previous
+
+    def test_prime_screening_uses_market_median_when_topix_is_empty(self):
+        index = pd.bdate_range("2025-01-01", periods=140)
+        close = pd.DataFrame({
+            "5802.T": np.linspace(100, 130, len(index)),
+            "6501.T": np.linspace(100, 120, len(index)),
+        }, index=index)
+        volume = pd.DataFrame(1000.0, index=index, columns=close.columns)
+        universe = pd.DataFrame({
+            "code": ["5802", "6501"], "company": ["A社", "B社"], "sector": ["非鉄金属", "電気機器"]
+        })
+        result = screen_prime_universe(universe, close, volume, None)
+        self.assertFalse(result.empty)
+        self.assertEqual(result.iloc[0]["market_benchmark_source"], "prime_universe_median_fallback")
 
     def test_edinet_csv_metrics_are_extracted(self):
         frame = pd.DataFrame({
