@@ -15,7 +15,7 @@ sys.path.insert(0, str(APP_DIR))
 
 from services.cross_sectional import run_cross_sectional_backtest  # noqa: E402
 from services.edinet import EdinetClient, _read_csv_package, extract_financial_metrics, get_fundamental_analysis, score_fundamentals  # noqa: E402
-from services.prime_ranking import atomic_replace_ranking, parse_prime_universe, read_latest_ranking, screen_prime_universe  # noqa: E402
+from services.prime_ranking import atomic_replace_ranking, now_jst, parse_prime_universe, read_latest_ranking, read_status, screen_prime_universe  # noqa: E402
 
 
 class EdinetAndCrossSectionalTest(unittest.TestCase):
@@ -38,6 +38,7 @@ class EdinetAndCrossSectionalTest(unittest.TestCase):
                     "rank": [1, 2], "code": ["5802", "6501"],
                     "company": ["A社", "B社"], "total_score": [80.0, 70.0],
                     "analyzed_at": ["2026-08-05T06:00:00+09:00"] * 2,
+                    "generated_date": [now_jst().date().isoformat()] * 2,
                     "positive_factors": [json.dumps(["positive"])] * 2,
                     "risk_factors": [json.dumps([])] * 2,
                 })
@@ -46,6 +47,8 @@ class EdinetAndCrossSectionalTest(unittest.TestCase):
                 self.assertTrue(result["available"])
                 self.assertEqual(result["ranking"][0]["code"], "5802")
                 self.assertEqual(result["ranking"][0]["positive_factors"], ["positive"])
+                self.assertFalse(result["refresh_allowed"])
+                self.assertEqual(read_status()["refresh_block_reason"], "ranking_already_generated_today")
         finally:
             if previous is None:
                 os.environ.pop("PRIME_RANKING_DIR", None)

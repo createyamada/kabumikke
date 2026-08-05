@@ -7,6 +7,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -17,6 +18,42 @@ from services import analysis
 JPX_LIST_PAGE = "https://www.jpx.co.jp/markets/statistics-equities/misc/01.html"
 REQUIRED_COLUMNS = {"rank", "code", "company", "total_score", "analyzed_at"}
 _worker_lock = threading.Lock()
+JST = ZoneInfo("Asia/Tokyo")
+
+
+def now_jst():
+    return datetime.now(JST)
+
+
+def latest_ranking_date():
+    path = ranking_paths()["latest"]
+    if not path.exists():
+        return None
+    try:
+        frame = pd.read_csv(path, nrows=1, dtype=str)
+        if frame.empty:
+            return None
+        if "generated_date" in frame:
+            return str(frame["generated_date"].iloc[0])
+        if "analyzed_at" in frame:
+            timestamp = pd.to_datetime(frame["analyzed_at"].iloc[0])
+            timestamp = timestamp.tz_localize(JST) if timestamp.tzinfo is None else timestamp.tz_convert(JST)
+            return timestamp.date().isoformat()
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return None
+
+
+def refresh_availability():
+    generated_date = latest_ranking_date()
+    today = now_jst().date().isoformat()
+    allowed = generated_date != today
+    return {
+        "refresh_allowed": allowed,
+        "refresh_block_reason": None if allowed else "ranking_already_generated_today",
+        "latest_generated_date": generated_date,
+        "today_jst": today,
+    }
 
 
 def ranking_paths():
@@ -47,9 +84,14 @@ def write_status(status, **values):
 def read_status():
     path = ranking_paths()["status"]
     if not path.exists():
-        return {"status": "not_started", "latest_csv_exists": ranking_paths()["latest"].exists()}
+        return {
+            "status": "not_started",
+            "latest_csv_exists": ranking_paths()["latest"].exists(),
+            **refresh_availability(),
+        }
     payload = json.loads(path.read_text(encoding="utf-8"))
     payload["latest_csv_exists"] = ranking_paths()["latest"].exists()
+    payload.update(refresh_availability())
     return payload
 
 
@@ -278,7 +320,9 @@ def atomic_replace_ranking(frame):
 
 
 def build_prime_ranking(limit=10, shortlist_size=50):
-    started = datetime.now().astimezone().isoformat()
+    if not refresh_availability()["refresh_allowed"]:
+        raise RuntimeError("ranking_already_generated_today")
+    started = now_jst().isoformat()
     write_status("running", started_at=started, analyzed_count=0, failed_count=0)
     try:
         universe = fetch_prime_universe()
@@ -295,21 +339,26 @@ def build_prime_ranking(limit=10, shortlist_size=50):
             raise RuntimeError("all advanced candidate analyses failed")
         ranking = pd.DataFrame(enriched).sort_values("total_score", ascending=False).reset_index(drop=True)
         ranking.insert(0, "rank", np.arange(1, len(ranking) + 1))
-        ranking["analyzed_at"] = datetime.now().astimezone().isoformat()
+        completed = now_jst()
+        ranking["generated_date"] = completed.date().isoformat()
+        ranking["analyzed_at"] = completed.isoformat()
         # CSVには候補全件を残し、API側でlimitを適用する。
         atomic_replace_ranking(ranking)
         write_status(
-            "completed", started_at=started, completed_at=datetime.now().astimezone().isoformat(),
+            "completed", started_at=started, completed_at=completed.isoformat(),
             universe_count=int(len(universe)), screening_count=int(len(screened)),
             analyzed_count=int(len(enriched)), failed_count=int(len(failures)), failures=failures[:20],
         )
         return ranking.head(limit)
     except Exception as error:
-        write_status("failed", started_at=started, failed_at=datetime.now().astimezone().isoformat(), error=str(error))
+        write_status("failed", started_at=started, failed_at=now_jst().isoformat(), error=str(error))
         raise
 
 
 def start_prime_ranking_refresh(limit=10, shortlist_size=50):
+    availability = refresh_availability()
+    if not availability["refresh_allowed"]:
+        return {"status": "already_generated_today", **availability}
     if not _worker_lock.acquire(blocking=False):
         return {"status": "already_running"}
 
@@ -321,7 +370,7 @@ def start_prime_ranking_refresh(limit=10, shortlist_size=50):
 
     thread = threading.Thread(target=worker, name="prime-ranking-refresh", daemon=True)
     thread.start()
-    return {"status": "queued", "started_at": datetime.now().astimezone().isoformat()}
+    return {"status": "queued", "started_at": now_jst().isoformat(), **refresh_availability()}
 
 
 def read_latest_ranking(limit=10):
@@ -340,5 +389,6 @@ def read_latest_ranking(limit=10):
         "source": path.name,
         "universe_count": status.get("universe_count"),
         "analyzed_count": status.get("analyzed_count"),
+        **refresh_availability(),
         "ranking": frame.to_dict(orient="records"),
     }

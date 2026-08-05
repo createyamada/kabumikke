@@ -32,6 +32,19 @@ GET /api/prime-ranking/status
 
 `status`は`not_started`、`running`、`completed`、`failed`のいずれかです。
 
+状態レスポンスの`refresh_allowed`が`false`の場合、フロントの更新ボタンを無効化してください。
+
+```json
+{
+  "refresh_allowed": false,
+  "refresh_block_reason": "ranking_already_generated_today",
+  "latest_generated_date": "2026-08-05",
+  "today_jst": "2026-08-05"
+}
+```
+
+判定日はサーバーのローカル時刻ではなく、日本時間`Asia/Tokyo`で統一しています。当日分のCSVが存在する場合は、画面側だけでなく更新API側でも二重生成を拒否します。
+
 ## 最新ランキング
 
 ```http
@@ -39,6 +52,8 @@ GET /api/prime-ranking?limit=10
 ```
 
 分析実行中は前回完成済みの`prime_ranking_latest.csv`を返します。新しいCSVは一時ファイルへ出力し、必須列・順位・銘柄重複を検証した後に`os.replace()`で置換します。処理失敗時は前回CSVを削除しません。
+
+CSVには日付`generated_date`と日時`analyzed_at`の両方を保存します。
 
 ## 出力ファイル
 
