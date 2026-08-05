@@ -2,6 +2,8 @@ import sys
 import json
 import os
 import tempfile
+import io
+import zipfile
 import unittest
 from pathlib import Path
 
@@ -12,7 +14,7 @@ APP_DIR = Path(__file__).resolve().parents[1] / "app"
 sys.path.insert(0, str(APP_DIR))
 
 from services.cross_sectional import run_cross_sectional_backtest  # noqa: E402
-from services.edinet import EdinetClient, extract_financial_metrics, get_fundamental_analysis, score_fundamentals  # noqa: E402
+from services.edinet import EdinetClient, _read_csv_package, extract_financial_metrics, get_fundamental_analysis, score_fundamentals  # noqa: E402
 from services.prime_ranking import atomic_replace_ranking, parse_prime_universe, read_latest_ranking, screen_prime_universe  # noqa: E402
 
 
@@ -74,6 +76,20 @@ class EdinetAndCrossSectionalTest(unittest.TestCase):
         self.assertEqual(metrics["revenue"], 1000.0)
         self.assertEqual(metrics["operating_income"], 100.0)
         self.assertGreater(score_fundamentals(metrics)["data_coverage"], 0)
+
+    def test_edinet_utf16_tab_separated_package_is_read(self):
+        text = (
+            '要素ID\t項目名\tコンテキストID\t値\r\n'
+            'jpcrp_cor:NetSales\t売上高\tCurrentYearDuration\t"1,000"\r\n'
+            'jpcrp_cor:OperatingIncome\t営業利益\tCurrentYearDuration\t100\r\n'
+        )
+        package = io.BytesIO()
+        with zipfile.ZipFile(package, "w") as archive:
+            archive.writestr("XBRL_TO_CSV/jpcrp_test.csv", text.encode("utf-16le"))
+        frames = _read_csv_package(package.getvalue())
+        metrics = extract_financial_metrics(frames)
+        self.assertEqual(metrics["revenue"], 1000.0)
+        self.assertEqual(metrics["operating_income"], 100.0)
 
     def test_edinet_without_api_key_degrades_gracefully(self):
         result = get_fundamental_analysis("5802", EdinetClient(api_key=""))

@@ -11,8 +11,8 @@ import pandas as pd
 
 BASE_URL = "https://api.edinet-fsa.go.jp/api/v2"
 METRIC_ALIASES = {
-    "revenue": ("Revenue", "NetSales", "OperatingRevenue", "売上高", "営業収益"),
-    "operating_income": ("OperatingIncome", "OperatingProfit", "営業利益"),
+    "revenue": ("Revenue", "NetSales", "OperatingRevenue", "SalesRevenue", "売上高", "営業収益", "売上収益", "完成工事高"),
+    "operating_income": ("OperatingIncome", "OperatingProfit", "ProfitLossFromOperatingActivities", "営業利益", "営業損益"),
     "ordinary_income": ("OrdinaryIncome", "OrdinaryProfit", "経常利益"),
     "net_income": ("ProfitLossAttributableToOwnersOfParent", "NetIncome", "当期純利益"),
     "total_assets": ("Assets", "TotalAssets", "資産合計"),
@@ -86,11 +86,23 @@ def _read_csv_package(content):
             if not name.lower().endswith(".csv"):
                 continue
             raw = archive.read(name)
-            for encoding in ("utf-16", "utf-8-sig", "cp932"):
+            # EDINETは拡張子.csvだが、公式仕様ではUTF-16LE・タブ区切り。
+            for encoding in ("utf-16", "utf-16le", "utf-8-sig", "cp932"):
                 try:
-                    frames.append(pd.read_csv(io.BytesIO(raw), encoding=encoding, dtype=str))
-                    break
-                except (UnicodeError, pd.errors.ParserError):
+                    frame = pd.read_csv(
+                        io.BytesIO(raw), encoding=encoding, sep="\t", dtype=str,
+                        keep_default_na=False,
+                    )
+                    frame.columns = [str(column).lstrip("\ufeff").strip() for column in frame.columns]
+                    if len(frame.columns) >= 3:
+                        frames.append(frame)
+                        break
+                    # 一部の非標準ファイルに限りカンマ区切りも試す。
+                    frame = pd.read_csv(io.BytesIO(raw), encoding=encoding, sep=",", dtype=str)
+                    if len(frame.columns) >= 3:
+                        frames.append(frame)
+                        break
+                except (UnicodeError, pd.errors.ParserError, UnicodeDecodeError):
                     continue
     return frames
 
@@ -115,7 +127,9 @@ def extract_financial_metrics(csv_frames):
         if not value_col or not (element_col or label_col):
             continue
         for _, row in frame.iterrows():
-            value_text = str(row.get(value_col, "")).replace(",", "").strip()
+            value_text = str(row.get(value_col, "")).replace(",", "").replace("△", "-").strip()
+            if value_text.startswith("(") and value_text.endswith(")"):
+                value_text = "-" + value_text[1:-1]
             try:
                 value = float(value_text)
             except ValueError:
