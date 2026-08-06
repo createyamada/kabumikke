@@ -1,10 +1,11 @@
 """TSE Prime universe screening with an atomic latest-only CSV store."""
 import io
 import json
+import multiprocessing
 import os
 import re
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
@@ -79,6 +80,34 @@ def write_status(status, **values):
     payload = {"status": status, **values}
     atomic_write_text(ranking_paths()["status"], json.dumps(payload, ensure_ascii=False, indent=2))
     return payload
+
+
+def write_progress(started_at, phase, phase_label, progress_percent, **values):
+    """Persist a UI-friendly progress snapshot, including a rolling ETA."""
+    now = now_jst()
+    try:
+        started = datetime.fromisoformat(started_at)
+        elapsed = max(0.0, (now - started).total_seconds())
+    except (TypeError, ValueError):
+        elapsed = 0.0
+    progress = float(np.clip(progress_percent, 0, 100))
+    remaining = None
+    estimated_completion = None
+    if 1 <= progress < 100 and elapsed > 0:
+        remaining = max(0, round(elapsed * (100 - progress) / progress))
+        estimated_completion = (now + timedelta(seconds=remaining)).isoformat()
+    return write_status(
+        "running",
+        started_at=started_at,
+        updated_at=now.isoformat(),
+        phase=phase,
+        phase_label=phase_label,
+        progress_percent=round(progress, 1),
+        elapsed_seconds=round(elapsed),
+        estimated_remaining_seconds=remaining,
+        estimated_completion_at=estimated_completion,
+        **values,
+    )
 
 
 def read_status():
@@ -167,17 +196,20 @@ def _extract_field(downloaded, field, symbols=None):
     return pd.DataFrame(index=downloaded.index)
 
 
-def download_market_matrices(codes, period="2y", chunk_size=100):
+def download_market_matrices(codes, period="2y", chunk_size=100, progress_callback=None):
     import yfinance as yf
 
     closes = []
     volumes = []
     symbols = [f"{code}.T" for code in codes]
-    for start in range(0, len(symbols), chunk_size):
+    chunks = list(range(0, len(symbols), chunk_size))
+    for chunk_index, start in enumerate(chunks, start=1):
         chunk = symbols[start:start + chunk_size]
         downloaded = yf.download(chunk, period=period, auto_adjust=True, progress=False, threads=True)
         closes.append(_extract_field(downloaded, "Close", chunk))
         volumes.append(_extract_field(downloaded, "Volume", chunk))
+        if progress_callback:
+            progress_callback(chunk_index, len(chunks))
     close = pd.concat(closes, axis=1).loc[:, lambda x: ~x.columns.duplicated()]
     volume = pd.concat(volumes, axis=1).loc[:, lambda x: ~x.columns.duplicated()]
     topix = None
@@ -323,20 +355,46 @@ def build_prime_ranking(limit=10, shortlist_size=50):
     if not refresh_availability()["refresh_allowed"]:
         raise RuntimeError("ranking_already_generated_today")
     started = now_jst().isoformat()
-    write_status("running", started_at=started, analyzed_count=0, failed_count=0)
+    common = {"analyzed_count": 0, "processed_count": 0, "failed_count": 0, "total_count": shortlist_size}
+    write_progress(started, "fetching_universe", "東証プライム銘柄一覧を取得中", 2, **common)
     try:
         universe = fetch_prime_universe()
-        close, volume, topix = download_market_matrices(universe["code"].tolist())
+        common["universe_count"] = int(len(universe))
+        write_progress(started, "downloading_prices", "全銘柄の株価・出来高を取得中", 10, **common)
+
+        def market_progress(completed_chunks, total_chunks):
+            progress = 10 + 25 * completed_chunks / max(total_chunks, 1)
+            write_progress(
+                started, "downloading_prices", "全銘柄の株価・出来高を取得中", progress,
+                market_chunks_completed=completed_chunks, market_chunks_total=total_chunks, **common,
+            )
+
+        close, volume, topix = download_market_matrices(
+            universe["code"].tolist(), progress_callback=market_progress,
+        )
+        write_progress(started, "screening", "テクニカル指標で候補を抽出中", 36, **common)
         screened = screen_prime_universe(universe, close, volume, topix)
+        target_count = min(shortlist_size, len(screened))
+        common.update(screening_count=int(len(screened)), total_count=int(target_count))
+        write_progress(started, "analyzing_candidates", "候補銘柄を高度分析中", 40, **common)
         enriched = []
         failures = []
-        for _, row in screened.head(shortlist_size).iterrows():
+        for processed, (_, row) in enumerate(screened.head(shortlist_size).iterrows(), start=1):
             try:
                 enriched.append(enrich_candidate(row))
             except Exception as error:
                 failures.append({"code": row["code"], "error": str(error)})
+            common.update(
+                analyzed_count=len(enriched), processed_count=processed,
+                failed_count=len(failures), current_code=str(row["code"]),
+            )
+            write_progress(
+                started, "analyzing_candidates", "候補銘柄を高度分析中",
+                40 + 55 * processed / max(target_count, 1), **common,
+            )
         if not enriched:
             raise RuntimeError("all advanced candidate analyses failed")
+        write_progress(started, "saving", "ランキングCSVを検証・保存中", 97, **common)
         ranking = pd.DataFrame(enriched).sort_values("total_score", ascending=False).reset_index(drop=True)
         ranking.insert(0, "rank", np.arange(1, len(ranking) + 1))
         completed = now_jst()
@@ -346,13 +404,21 @@ def build_prime_ranking(limit=10, shortlist_size=50):
         atomic_replace_ranking(ranking)
         write_status(
             "completed", started_at=started, completed_at=completed.isoformat(),
+            updated_at=completed.isoformat(), phase="completed", phase_label="ランキング生成完了",
+            progress_percent=100.0, elapsed_seconds=round((completed - datetime.fromisoformat(started)).total_seconds()),
+            estimated_remaining_seconds=0, estimated_completion_at=completed.isoformat(),
             universe_count=int(len(universe)), screening_count=int(len(screened)),
+            total_count=int(target_count), processed_count=int(target_count),
             analyzed_count=int(len(enriched)), failed_count=int(len(failures)), failures=failures[:20],
         )
         return ranking.head(limit)
     except Exception as error:
         write_status("failed", started_at=started, failed_at=now_jst().isoformat(), error=str(error))
         raise
+
+
+def _ranking_process_worker(limit, shortlist_size):
+    build_prime_ranking(limit=limit, shortlist_size=shortlist_size)
 
 
 def start_prime_ranking_refresh(limit=10, shortlist_size=50):
@@ -362,15 +428,49 @@ def start_prime_ranking_refresh(limit=10, shortlist_size=50):
     if not _worker_lock.acquire(blocking=False):
         return {"status": "already_running"}
 
-    def worker():
-        try:
-            build_prime_ranking(limit=limit, shortlist_size=shortlist_size)
-        finally:
-            _worker_lock.release()
+    queued_at = now_jst().isoformat()
+    write_status(
+        "queued", started_at=queued_at, updated_at=queued_at,
+        phase="queued", phase_label="ランキング処理を開始しています",
+        progress_percent=0.0, analyzed_count=0, processed_count=0,
+        failed_count=0, total_count=shortlist_size,
+    )
+    process = None
+    try:
+        # A separate process keeps CPU-heavy ranking work from blocking individual analysis.
+        if multiprocessing.current_process().daemon:
+            raise RuntimeError("process spawning is unavailable from a daemon worker")
+        process = multiprocessing.Process(
+            target=_ranking_process_worker,
+            args=(limit, shortlist_size),
+            name="prime-ranking-refresh",
+            daemon=True,
+        )
+        process.start()
+    except Exception:
+        # Some application servers run daemon workers that cannot create children.
+        # A background thread still avoids any application-wide request lock.
+        def thread_worker():
+            try:
+                build_prime_ranking(limit=limit, shortlist_size=shortlist_size)
+            finally:
+                _worker_lock.release()
 
-    thread = threading.Thread(target=worker, name="prime-ranking-refresh", daemon=True)
-    thread.start()
-    return {"status": "queued", "started_at": now_jst().isoformat(), **refresh_availability()}
+        threading.Thread(target=thread_worker, name="prime-ranking-refresh", daemon=True).start()
+        return {**read_status(), **refresh_availability()}
+
+    def monitor():
+        process.join()
+        _worker_lock.release()
+        if process.exitcode and read_status().get("status") not in {"failed", "completed"}:
+            write_status(
+                "failed", started_at=queued_at, failed_at=now_jst().isoformat(),
+                phase="failed", phase_label="ランキング生成に失敗しました",
+                progress_percent=0.0, error=f"ranking worker exited with code {process.exitcode}",
+            )
+
+    threading.Thread(target=monitor, name="prime-ranking-monitor", daemon=True).start()
+    return {**read_status(), **refresh_availability()}
 
 
 def read_latest_ranking(limit=10):
