@@ -735,6 +735,130 @@ def build_confidence_assessment(
     }
 
 
+def summarize_technical_analysis(divided_datas):
+    """最新特徴量を、画面表示可能なシグナル・価格水準・0～100点へ整理する。"""
+    source = divided_datas.get('source_data')
+    if source is None or source.empty:
+        return {'available': False}
+    row = source.iloc[-1]
+
+    def number(name, default=None):
+        value = row.get(name, default)
+        return float(value) if pd.notna(value) else default
+
+    positive, negative, neutral = [], [], []
+    score = 50
+    if number('perfect_order_bull', 0) > 0:
+        positive.append('移動平均線が上昇パーフェクトオーダー')
+        score += 12
+    elif number('perfect_order_bear', 0) > 0:
+        negative.append('移動平均線が下降パーフェクトオーダー')
+        score -= 12
+    if number('golden_cross', 0) > 0:
+        positive.append('当日にゴールデンクロスが発生')
+        score += 8
+    if number('dead_cross', 0) > 0:
+        negative.append('当日にデッドクロスが発生')
+        score -= 8
+    if number('breakout_up20', 0) > 0:
+        positive.append('20日高値を上抜け')
+        score += 8
+    if number('breakout_down20', 0) > 0:
+        negative.append('20日安値を下抜け')
+        score -= 8
+    if number('higher_high', 0) > 0 and number('higher_low', 0) > 0:
+        positive.append('高値・安値がともに切り上がり')
+        score += 6
+    adx = number('adx14')
+    plus_di, minus_di = number('plus_di14'), number('minus_di14')
+    if adx is not None and adx >= 0.25:
+        if plus_di is not None and minus_di is not None and plus_di > minus_di:
+            positive.append('ADXが示す上昇トレンドが強い')
+            score += 6
+        else:
+            negative.append('ADXが示す下降トレンドが強い')
+            score -= 6
+    rsi = number('rsi14')
+    if rsi is not None and rsi >= 0.70:
+        negative.append('RSIが買われすぎ圏')
+        score -= 3
+    elif rsi is not None and rsi <= 0.30:
+        neutral.append('RSIが売られすぎ圏で反発余地と下落継続の両面あり')
+    cloud_position = number('ichimoku_cloud_position', 0)
+    if cloud_position > 0:
+        positive.append('株価が一目均衡表の雲より上')
+        score += 5
+    elif cloud_position < 0:
+        negative.append('株価が一目均衡表の雲より下')
+        score -= 5
+    if number('bullish_engulfing', 0) > 0:
+        positive.append('陽の包み足')
+        score += 4
+    if number('bearish_engulfing', 0) > 0:
+        negative.append('陰の包み足')
+        score -= 4
+    if number('doji', 0) > 0:
+        neutral.append('十字線に近く方向感が弱い')
+
+    latest_close = number('Close', divided_datas.get('last_close'))
+    resistance_gap = number('resistance_gap20')
+    support_gap = number('support_gap20')
+    resistance = latest_close / (1 + resistance_gap) if resistance_gap is not None and 1 + resistance_gap else None
+    support = latest_close / (1 + support_gap) if support_gap is not None and 1 + support_gap else None
+    return {
+        'available': True,
+        'technical_score': int(np.clip(score, 0, 100)),
+        'signal': '強気' if score >= 65 else '弱気' if score <= 35 else '中立',
+        'positive_factors': positive,
+        'negative_factors': negative,
+        'neutral_factors': neutral,
+        'moving_average': {
+            'sma5': number('SMA5'), 'sma25': number('SMA25'), 'sma70': number('SMA70'),
+            'sma5_sma25_gap': number('sma5_sma25_gap'),
+            'sma25_sma70_gap': number('sma25_sma70_gap'),
+            'days_since_golden_cross': number('days_since_golden_cross'),
+            'days_since_dead_cross': number('days_since_dead_cross'),
+            'order_score': number('ma_order_score'),
+        },
+        'price_zone': {
+            'resistance_20d': resistance, 'support_20d': support,
+            'distance_from_high20': number('distance_from_high20'),
+            'distance_from_high60': number('distance_from_high60'),
+            'distance_from_high252': number('distance_from_high252'),
+            'distance_from_low20': number('distance_from_low20'),
+            'distance_from_low60': number('distance_from_low60'),
+            'range_width20': number('range_width20'),
+        },
+        'candlestick': {
+            'body_ratio': number('candle_body_ratio'),
+            'upper_shadow_ratio': number('upper_shadow_ratio'),
+            'lower_shadow_ratio': number('lower_shadow_ratio'),
+            'gap_rate': number('gap_rate'),
+            'consecutive_bullish': number('consecutive_bullish'),
+            'consecutive_bearish': number('consecutive_bearish'),
+            'bullish_engulfing': bool(number('bullish_engulfing', 0)),
+            'bearish_engulfing': bool(number('bearish_engulfing', 0)),
+            'doji': bool(number('doji', 0)),
+        },
+        'oscillators': {
+            'rsi14': rsi, 'stochastic_k': number('stochastic_k'),
+            'stochastic_d': number('stochastic_d'), 'adx14': adx,
+            'plus_di14': plus_di, 'minus_di14': minus_di,
+            'roc10': number('roc10'), 'cci20': number('cci20'), 'mfi14': number('mfi14'),
+        },
+        'volume': {
+            'obv_slope20': number('obv_slope20'), 'vwap20_gap': number('vwap20_gap'),
+            'volume_profile_poc_gap': number('volume_profile_poc_gap'),
+            'volume_profile_value_area_width': number('volume_profile_value_area_width'),
+        },
+        'ichimoku': {
+            'tenkan_gap': number('ichimoku_tenkan_gap'), 'kijun_gap': number('ichimoku_kijun_gap'),
+            'tenkan_kijun_gap': number('ichimoku_tenkan_kijun_gap'),
+            'cloud_position': cloud_position, 'cloud_width': number('ichimoku_cloud_width'),
+        },
+    }
+
+
 def price_predict(divided_datas):
     """
     重回帰分析により予測する
@@ -927,6 +1051,7 @@ def price_predict(divided_datas):
         'return_risk': return_risk,
         'topix_excess_return_prediction': excess_return_prediction,
         'industry_relative_strength': industry_relative_strength,
+        'technical_analysis': summarize_technical_analysis(divided_datas),
         'horizon_predictions': horizon_predictions,
         'confidence': confidence,
         'probability_evaluation': probability_evaluation,

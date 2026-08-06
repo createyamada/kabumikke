@@ -155,6 +155,8 @@ class StockAnalysisTest(unittest.TestCase):
         self.assertIn("topix_excess_return_prediction", result)
         self.assertTrue(result["topix_excess_return_prediction"]["available"])
         self.assertIn("industry_relative_strength", result)
+        self.assertIn("technical_analysis", result)
+        self.assertTrue(result["technical_analysis"]["available"])
         self.assertGreaterEqual(result["up_probability"], 0.0)
         self.assertLessEqual(result["up_probability"], 1.0)
         self.assertEqual(set(result["horizon_predictions"]), {"1", "5", "20"})
@@ -186,6 +188,34 @@ class StockAnalysisTest(unittest.TestCase):
 
         self.assertEqual(points.shape, (46, 3))
         self.assertTrue(np.allclose(points.mean(axis=0), 0.0))
+
+    def test_advanced_technical_features_exist_without_future_leakage(self):
+        index = pd.bdate_range("2024-01-01", periods=320)
+        base = 100 + np.arange(len(index)) * 0.1 + np.sin(np.arange(len(index)) / 5)
+
+        def build(last_close_adjustment=0):
+            close = base.copy()
+            close[-1] += last_close_adjustment
+            frame = pd.DataFrame({
+                "Open": close - 0.2, "High": close + 1.0, "Low": close - 1.0,
+                "Close": close, "Volume": 100000 + np.arange(len(index)) * 10,
+                "nikkei_open": close, "nikkei_close": close,
+                "topix_open": close, "topix_close": close,
+                "dow_open": close, "dow_close": close,
+                "jpy_open": close, "jpy_close": close,
+            }, index=index)
+            return format.merge_all_company_info([frame])
+
+        original = build()
+        changed_future = build(last_close_adjustment=100)
+        self.assertFalse(original[config.EXPLANATORY_VARIABLES_ANALYSIS].iloc[-1].isna().any())
+        for column in (
+            "sma5_sma25_gap", "golden_cross", "distance_from_high252",
+            "candle_body_ratio", "stochastic_k", "adx14", "cci20", "mfi14",
+            "vwap20_gap", "ichimoku_cloud_position", "volume_profile_poc_gap",
+        ):
+            self.assertIn(column, original.columns)
+            self.assertAlmostEqual(original[column].iloc[-2], changed_future[column].iloc[-2])
 
     def test_next_weekday_skips_weekend(self):
         self.assertEqual(get_next_weekday("2026-08-07"), "2026-08-10")

@@ -3,6 +3,63 @@ import numpy as np
 from datetime import datetime, timedelta
 from library import config
 
+
+def _days_since_signal(signal):
+    """当日を0として直近シグナルからの営業日数を返す。未発生は-1。"""
+    result = []
+    elapsed = -1
+    for active in signal.fillna(False).astype(bool):
+        if active:
+            elapsed = 0
+        elif elapsed >= 0:
+            elapsed += 1
+        result.append(elapsed)
+    return pd.Series(result, index=signal.index, dtype=float)
+
+
+def _consecutive_count(condition):
+    count = 0
+    values = []
+    for active in condition.fillna(False).astype(bool):
+        count = count + 1 if active else 0
+        values.append(count)
+    return pd.Series(values, index=condition.index, dtype=float)
+
+
+def _volume_profile_features(close, volume, window=60, bins=12):
+    """過去window日だけを使用し、出来高集中価格と70%価値領域幅を近似する。"""
+    poc_gap = np.full(len(close), np.nan)
+    value_area_width = np.full(len(close), np.nan)
+    close_values = close.to_numpy(dtype=float)
+    volume_values = volume.fillna(0).to_numpy(dtype=float)
+    for end in range(window - 1, len(close)):
+        prices = close_values[end - window + 1:end + 1]
+        weights = volume_values[end - window + 1:end + 1]
+        valid = np.isfinite(prices) & np.isfinite(weights) & (weights >= 0)
+        prices, weights = prices[valid], weights[valid]
+        if len(prices) < window // 2 or prices.max() <= prices.min() or weights.sum() <= 0:
+            continue
+        edges = np.linspace(prices.min(), prices.max(), bins + 1)
+        bucket = np.clip(np.digitize(prices, edges[1:-1]), 0, bins - 1)
+        profile = np.bincount(bucket, weights=weights, minlength=bins)
+        centers = (edges[:-1] + edges[1:]) / 2
+        poc = centers[int(np.argmax(profile))]
+        order = np.argsort(profile)[::-1]
+        selected = []
+        accumulated = 0.0
+        for index in order:
+            selected.append(index)
+            accumulated += profile[index]
+            if accumulated >= profile.sum() * 0.70:
+                break
+        low, high = edges[min(selected)], edges[max(selected) + 1]
+        poc_gap[end] = close_values[end] / poc - 1 if poc else np.nan
+        value_area_width[end] = (high - low) / close_values[end] if close_values[end] else np.nan
+    return (
+        pd.Series(poc_gap, index=close.index),
+        pd.Series(value_area_width, index=close.index),
+    )
+
 def merge_all_company_info(infos: list):
     """
     リストの要素数分データフレームを結合する
@@ -92,6 +149,115 @@ def merge_all_company_info(infos: list):
     merged_df['volatility20'] = merged_df['return_1d'].rolling(20).std()
     merged_df['volume_change'] = merged_df['Volume'].pct_change()
     merged_df['volume_ratio20'] = merged_df['Volume'] / merged_df['Volume'].rolling(20).mean() - 1
+
+    # 移動平均線の相互関係、クロス、傾き、並び順。
+    merged_df['sma5_sma25_gap'] = merged_df['SMA5'] / merged_df['SMA25'] - 1
+    merged_df['sma25_sma70_gap'] = merged_df['SMA25'] / merged_df['SMA70'] - 1
+    merged_df['sma5_slope5'] = merged_df['SMA5'].pct_change(5)
+    merged_df['sma25_slope5'] = merged_df['SMA25'].pct_change(5)
+    merged_df['sma70_slope5'] = merged_df['SMA70'].pct_change(5)
+    above = merged_df['SMA5'] > merged_df['SMA25']
+    previous_above = above.shift(1, fill_value=False).astype(bool)
+    merged_df['golden_cross'] = (above & ~previous_above).astype(float)
+    merged_df['dead_cross'] = (~above & previous_above).astype(float)
+    merged_df['days_since_golden_cross'] = _days_since_signal(merged_df['golden_cross'] > 0)
+    merged_df['days_since_dead_cross'] = _days_since_signal(merged_df['dead_cross'] > 0)
+    bullish_order = (merged_df['SMA5'] > merged_df['SMA25']) & (merged_df['SMA25'] > merged_df['SMA70'])
+    bearish_order = (merged_df['SMA5'] < merged_df['SMA25']) & (merged_df['SMA25'] < merged_df['SMA70'])
+    merged_df['ma_order_score'] = np.select([bullish_order, bearish_order], [1.0, -1.0], default=0.0)
+    merged_df['perfect_order_bull'] = (bullish_order & (merged_df['sma5_slope5'] > 0) & (merged_df['sma25_slope5'] > 0)).astype(float)
+    merged_df['perfect_order_bear'] = (bearish_order & (merged_df['sma5_slope5'] < 0) & (merged_df['sma25_slope5'] < 0)).astype(float)
+
+    # トレンド・価格帯。ブレイクアウト判定は当日を除く過去水準と比較する。
+    high20, high60, high252 = (merged_df['High'].rolling(window).max() for window in (20, 60, 252))
+    low20, low60 = (merged_df['Low'].rolling(window).min() for window in (20, 60))
+    merged_df['distance_from_high20'] = merged_df['Close'] / high20 - 1
+    merged_df['distance_from_high60'] = merged_df['Close'] / high60 - 1
+    merged_df['distance_from_high252'] = merged_df['Close'] / high252 - 1
+    merged_df['distance_from_low20'] = merged_df['Close'] / low20 - 1
+    merged_df['distance_from_low60'] = merged_df['Close'] / low60 - 1
+    merged_df['higher_high'] = (merged_df['High'].rolling(5).max() > merged_df['High'].rolling(5).max().shift(5)).astype(float)
+    merged_df['higher_low'] = (merged_df['Low'].rolling(5).min() > merged_df['Low'].rolling(5).min().shift(5)).astype(float)
+    prior_resistance = merged_df['High'].rolling(20).max().shift(1)
+    prior_support = merged_df['Low'].rolling(20).min().shift(1)
+    merged_df['resistance_gap20'] = merged_df['Close'] / prior_resistance - 1
+    merged_df['support_gap20'] = merged_df['Close'] / prior_support - 1
+    merged_df['breakout_up20'] = (merged_df['Close'] > prior_resistance).astype(float)
+    merged_df['breakout_down20'] = (merged_df['Close'] < prior_support).astype(float)
+    merged_df['range_width20'] = (high20 - low20) / merged_df['Close']
+    merged_df['range_width60'] = (high60 - low60) / merged_df['Close']
+
+    # ローソク足形状と連続性。
+    candle_range = (merged_df['High'] - merged_df['Low']).replace(0, np.nan)
+    candle_top = merged_df[['Open', 'Close']].max(axis=1)
+    candle_bottom = merged_df[['Open', 'Close']].min(axis=1)
+    merged_df['candle_body_ratio'] = ((merged_df['Close'] - merged_df['Open']).abs() / candle_range).fillna(0)
+    merged_df['upper_shadow_ratio'] = ((merged_df['High'] - candle_top) / candle_range).fillna(0)
+    merged_df['lower_shadow_ratio'] = ((candle_bottom - merged_df['Low']) / candle_range).fillna(0)
+    merged_df['gap_rate'] = merged_df['Open'] / merged_df['Close'].shift(1) - 1
+    bullish_candle = merged_df['Close'] > merged_df['Open']
+    bearish_candle = merged_df['Close'] < merged_df['Open']
+    merged_df['consecutive_bullish'] = _consecutive_count(bullish_candle)
+    merged_df['consecutive_bearish'] = _consecutive_count(bearish_candle)
+    previous_top = merged_df[['Open', 'Close']].max(axis=1).shift(1)
+    previous_bottom = merged_df[['Open', 'Close']].min(axis=1).shift(1)
+    merged_df['bullish_engulfing'] = (bullish_candle & bearish_candle.shift(1).fillna(False) & (candle_top >= previous_top) & (candle_bottom <= previous_bottom)).astype(float)
+    merged_df['bearish_engulfing'] = (bearish_candle & bullish_candle.shift(1).fillna(False) & (candle_top >= previous_top) & (candle_bottom <= previous_bottom)).astype(float)
+    merged_df['doji'] = (merged_df['candle_body_ratio'] <= 0.10).astype(float)
+
+    # ストキャスティクス、DMI/ADX、ROC、CCI。
+    lowest14 = merged_df['Low'].rolling(14).min()
+    highest14 = merged_df['High'].rolling(14).max()
+    merged_df['stochastic_k'] = ((merged_df['Close'] - lowest14) / (highest14 - lowest14).replace(0, np.nan)).fillna(0.5)
+    merged_df['stochastic_d'] = merged_df['stochastic_k'].rolling(3).mean()
+    up_move = merged_df['High'].diff()
+    down_move = -merged_df['Low'].diff()
+    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=merged_df.index)
+    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=merged_df.index)
+    atr14 = true_range.rolling(14).mean().replace(0, np.nan)
+    merged_df['plus_di14'] = plus_dm.rolling(14).mean() / atr14
+    merged_df['minus_di14'] = minus_dm.rolling(14).mean() / atr14
+    dx = ((merged_df['plus_di14'] - merged_df['minus_di14']).abs() / (merged_df['plus_di14'] + merged_df['minus_di14']).replace(0, np.nan)).fillna(0)
+    merged_df['adx14'] = dx.rolling(14).mean().fillna(0)
+    merged_df['roc10'] = merged_df['Close'].pct_change(10)
+    typical_price = (merged_df['High'] + merged_df['Low'] + merged_df['Close']) / 3
+    typical_mean = typical_price.rolling(20).mean()
+    mean_deviation = typical_price.rolling(20).apply(lambda values: np.mean(np.abs(values - np.mean(values))), raw=True)
+    merged_df['cci20'] = ((typical_price - typical_mean) / (0.015 * mean_deviation.replace(0, np.nan))).fillna(0)
+
+    # OBV、MFI、VWAP。
+    direction = np.sign(merged_df['Close'].diff()).fillna(0)
+    obv = (direction * merged_df['Volume'].fillna(0)).cumsum()
+    merged_df['obv_slope20'] = (obv.diff(20) / (merged_df['Volume'].rolling(20).mean() * 20).replace(0, np.nan)).fillna(0)
+    raw_money_flow = typical_price * merged_df['Volume']
+    positive_flow = raw_money_flow.where(typical_price.diff() > 0, 0.0).rolling(14).sum()
+    negative_flow = raw_money_flow.where(typical_price.diff() < 0, 0.0).rolling(14).sum()
+    money_ratio = positive_flow / negative_flow.replace(0, np.nan)
+    mfi = 1 - 1 / (1 + money_ratio)
+    mfi = mfi.mask((negative_flow == 0) & (positive_flow > 0), 1.0)
+    mfi = mfi.mask((positive_flow == 0) & (negative_flow > 0), 0.0)
+    merged_df['mfi14'] = mfi.fillna(0.5)
+    rolling_vwap20 = raw_money_flow.rolling(20).sum() / merged_df['Volume'].rolling(20).sum().replace(0, np.nan)
+    merged_df['vwap20_gap'] = merged_df['Close'] / rolling_vwap20 - 1
+
+    # 一目均衡表。先行スパンは26日前に計算された値だけを現在位置へ利用する。
+    tenkan = (merged_df['High'].rolling(9).max() + merged_df['Low'].rolling(9).min()) / 2
+    kijun = (merged_df['High'].rolling(26).max() + merged_df['Low'].rolling(26).min()) / 2
+    senkou_a = ((tenkan + kijun) / 2).shift(26)
+    senkou_b = ((merged_df['High'].rolling(52).max() + merged_df['Low'].rolling(52).min()) / 2).shift(26)
+    cloud_top = pd.concat([senkou_a, senkou_b], axis=1).max(axis=1)
+    cloud_bottom = pd.concat([senkou_a, senkou_b], axis=1).min(axis=1)
+    merged_df['ichimoku_tenkan_gap'] = merged_df['Close'] / tenkan - 1
+    merged_df['ichimoku_kijun_gap'] = merged_df['Close'] / kijun - 1
+    merged_df['ichimoku_tenkan_kijun_gap'] = tenkan / kijun - 1
+    merged_df['ichimoku_cloud_position'] = np.select(
+        [merged_df['Close'] > cloud_top, merged_df['Close'] < cloud_bottom], [1.0, -1.0], default=0.0
+    )
+    merged_df['ichimoku_cloud_width'] = (cloud_top - cloud_bottom) / merged_df['Close']
+
+    merged_df['volume_profile_poc_gap'], merged_df['volume_profile_value_area_width'] = _volume_profile_features(
+        merged_df['Close'], merged_df['Volume'], window=60
+    )
     merged_df['nikkei_return'] = merged_df['nikkei_close'].pct_change()
     # TOPIXが取得できない日は日経平均の変化率を市場代理値として利用する。
     if 'topix_close' in merged_df.columns:
