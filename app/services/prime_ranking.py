@@ -291,7 +291,7 @@ def enrich_candidate(row):
     excess = prediction.get("topix_excess_return_prediction", {})
     confidence = prediction.get("confidence", {})
     fundamental = prediction.get("fundamental_analysis", {})
-    topology = prediction.get("topological_analysis", {})
+    topology = prediction.get("topological_analysis") or {}
     financial_score = fundamental.get("assessment", {}).get("score") if fundamental.get("available") else None
     expected = _safe_number(risk.get("expected_return_after_cost"))
     probability = _safe_number(horizon5.get("up_probability"), 0.5)
@@ -387,6 +387,7 @@ def build_prime_ranking(limit=10, shortlist_size=50):
             common.update(
                 analyzed_count=len(enriched), processed_count=processed,
                 failed_count=len(failures), current_code=str(row["code"]),
+                current_company=str(row["company"]),
             )
             write_progress(
                 started, "analyzing_candidates", "候補銘柄を高度分析中",

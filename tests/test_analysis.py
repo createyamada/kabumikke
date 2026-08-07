@@ -174,13 +174,8 @@ class StockAnalysisTest(unittest.TestCase):
         self.assertEqual(result["backtest"]["execution_lag_business_days"], 1)
         self.assertIn("sortino_ratio", result["backtest"])
         self.assertLess(result["prediction_interval"]["lower_price"], result["prediction_interval"]["upper_price"])
-        self.assertEqual(
-            result["topological_analysis"]["method"],
-            "vietoris_rips_persistent_homology",
-        )
-        self.assertGreater(result["topological_analysis"]["h1_loops"]["feature_count"], 0)
-        self.assertFalse(result["topological_analysis"]["included_in_health_score"])
-        self.assertEqual(set(result["topological_analysis_multi_window"]["windows"]), {"60", "120", "252"})
+        self.assertIsNone(result["topological_analysis"])
+        self.assertIsNone(result["topological_analysis_multi_window"])
         self.assertEqual(result["data_quality"]["us_market_lag_business_days"], 1)
 
     def test_delay_embedding_has_requested_dimension(self):

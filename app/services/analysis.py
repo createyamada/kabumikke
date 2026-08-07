@@ -11,7 +11,9 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit
 # 予測精度検証のためMSEをインポート
 from sklearn.metrics import mean_squared_error as mse
-from ripser import ripser
+# TDA is currently disabled in price prediction. Keep the dependency and
+# implementation below so it can be restored after predictive validation.
+# from ripser import ripser
 import numpy as np
 import pandas as pd
 import re
@@ -350,6 +352,8 @@ def analyze_topology(divided_datas, window=252, dimension=3, delay=1):
         returns = np.r_[returns, float(latest_return)][-window:]
 
     point_cloud = create_delay_embedding(returns, dimension=dimension, delay=delay)
+    # Lazy import prevents loading the TDA runtime during normal analysis.
+    from ripser import ripser
     diagrams = ripser(point_cloud, maxdim=1)['dgms']
     h0 = summarize_persistence_diagram(diagrams[0])
     h1 = summarize_persistence_diagram(diagrams[1])
@@ -961,7 +965,9 @@ def price_predict(divided_datas):
     result = pd.concat([result, new_row])
 
     backtest = calculate_backtest(actual, Y_pred)
-    topology = analyze_topology(divided_datas)
+    # TDA calculation is intentionally disabled to reduce analysis time.
+    # topology = analyze_topology(divided_datas)
+    topology = None
     up_probability = estimate_up_probability(tomorrow_return, residuals)
     probability_evaluation = evaluate_probability_calibration(actual, Y_pred)
     classifier_probability = train_calibrated_direction_classifier(
@@ -1013,7 +1019,9 @@ def price_predict(divided_datas):
     )
     source_data = divided_datas.get('source_data')
     excess_return_prediction = predict_topix_excess_return(divided_datas, available_columns)
-    topology_multi_window = analyze_topology_multi_window(divided_datas)
+    # Multi-window TDA is retained above for future use but is not calculated.
+    # topology_multi_window = analyze_topology_multi_window(divided_datas)
+    topology_multi_window = None
     sector_source = (
         str(source_data['sector_benchmark_source'].iloc[-1])
         if source_data is not None and 'sector_benchmark_source' in source_data else None
