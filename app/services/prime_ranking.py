@@ -5,6 +5,7 @@ import multiprocessing
 import os
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urljoin
@@ -20,6 +21,26 @@ JPX_LIST_PAGE = "https://www.jpx.co.jp/markets/statistics-equities/misc/01.html"
 REQUIRED_COLUMNS = {"rank", "code", "company", "total_score", "analyzed_at"}
 _worker_lock = threading.Lock()
 JST = ZoneInfo("Asia/Tokyo")
+
+SECTOR_ETF_RULES = (
+    (("水産", "農林", "食品"), "1617.T"),
+    (("鉱業", "石油", "石炭"), "1618.T"),
+    (("建設",), "1619.T"),
+    (("繊維", "パルプ", "紙", "化学"), "1620.T"),
+    (("医薬品",), "1621.T"),
+    (("ゴム", "輸送用機器"), "1622.T"),
+    (("鉄鋼", "非鉄金属", "金属製品"), "1623.T"),
+    (("機械",), "1624.T"),
+    (("電気機器", "精密機器"), "1625.T"),
+    (("情報・通信", "サービス"), "1626.T"),
+    (("電気・ガス",), "1627.T"),
+    (("陸運", "海運", "空運", "倉庫"), "1628.T"),
+    (("卸売",), "1629.T"),
+    (("小売",), "1630.T"),
+    (("銀行",), "1631.T"),
+    (("証券", "保険", "その他金融"), "1632.T"),
+    (("不動産",), "1633.T"),
+)
 
 
 def now_jst():
@@ -226,6 +247,65 @@ def download_market_matrices(codes, period="2y", chunk_size=100, progress_callba
     return close, volume, topix
 
 
+def sector_etf_symbol(sector_name):
+    name = str(sector_name or "")
+    for keywords, symbol in SECTOR_ETF_RULES:
+        if any(keyword in name for keyword in keywords):
+            return symbol
+    return None
+
+
+def _bulk_symbol_frame(downloaded, symbol):
+    if downloaded is None or downloaded.empty:
+        return pd.DataFrame()
+    if isinstance(downloaded.columns, pd.MultiIndex):
+        if symbol in downloaded.columns.get_level_values(0):
+            frame = downloaded.xs(symbol, axis=1, level=0)
+        elif symbol in downloaded.columns.get_level_values(-1):
+            frame = downloaded.xs(symbol, axis=1, level=-1)
+        else:
+            return pd.DataFrame()
+    else:
+        frame = downloaded.copy()
+    wanted = [column for column in ("Open", "High", "Low", "Close", "Volume") if column in frame]
+    return frame[wanted].dropna(how="all").copy() if wanted else pd.DataFrame()
+
+
+def download_candidate_analysis_data(candidates, period=None):
+    """Fetch candidate, common-market and sector histories in one bulk request."""
+    import yfinance as yf
+
+    period = period or analysis.HISTORY_PERIOD
+    rows = candidates.to_dict(orient="records")
+    sector_symbols = {sector_etf_symbol(row.get("sector")) for row in rows}
+    sector_symbols.discard(None)
+    common_symbols = {"^N225", "^TOPX", "1306.T", "JPY=X", "^DJI", "YM=F"}
+    symbols = [f"{row['code']}.T" for row in rows] + sorted(common_symbols | sector_symbols)
+    downloaded = yf.download(
+        symbols, period=period, auto_adjust=True, progress=False,
+        threads=True, group_by="column",
+    )
+    histories = {symbol: _bulk_symbol_frame(downloaded, symbol) for symbol in symbols}
+    topix = histories.get("^TOPX")
+    if topix is None or topix.empty:
+        topix = histories.get("1306.T", pd.DataFrame())
+    result = {}
+    for row in rows:
+        sector_symbol = sector_etf_symbol(row.get("sector"))
+        result[str(row["code"])] = {
+            "company": histories.get(f"{row['code']}.T", pd.DataFrame()),
+            "nikkei": histories.get("^N225", pd.DataFrame()),
+            "topix": topix,
+            "jpy": histories.get("JPY=X", pd.DataFrame()),
+            "dow": histories.get("^DJI", pd.DataFrame()),
+            "mini_dow": histories.get("YM=F", pd.DataFrame()),
+            "sector": histories.get(sector_symbol, pd.DataFrame()) if sector_symbol else pd.DataFrame(),
+            "sector_symbol": sector_symbol,
+            "sector_name": row.get("sector"),
+        }
+    return result
+
+
 def screen_prime_universe(universe, close, volume, topix):
     """全銘柄をベクトル演算し、高度分析候補をランキングする。"""
     close = close.ffill()
@@ -282,9 +362,11 @@ def _safe_number(value, default=0.0):
         return default
 
 
-def enrich_candidate(row):
+def enrich_candidate(row, preloaded=None):
     """既存の単銘柄高度分析を候補銘柄へ適用し、ランキング用の平坦な行へ変換する。"""
-    result = analysis.get_prediction(row["code"])
+    result = analysis.get_prediction(
+        row["code"], preloaded=preloaded, company_name=row.get("company"),
+    )
     prediction = result["prediction"]
     horizon5 = prediction.get("horizon_predictions", {}).get("5", {})
     risk = prediction.get("return_risk", {})
@@ -375,24 +457,37 @@ def build_prime_ranking(limit=10, shortlist_size=50):
         write_progress(started, "screening", "テクニカル指標で候補を抽出中", 36, **common)
         screened = screen_prime_universe(universe, close, volume, topix)
         target_count = min(shortlist_size, len(screened))
+        candidates = screened.head(shortlist_size).copy()
         common.update(screening_count=int(len(screened)), total_count=int(target_count))
-        write_progress(started, "analyzing_candidates", "候補銘柄を高度分析中", 40, **common)
+        write_progress(started, "preloading_candidate_data", "候補銘柄の共通データを一括取得中", 40, **common)
+        preloaded_by_code = download_candidate_analysis_data(candidates)
+        write_progress(started, "analyzing_candidates", "候補銘柄を並列分析中", 48, **common)
         enriched = []
         failures = []
-        for processed, (_, row) in enumerate(screened.head(shortlist_size).iterrows(), start=1):
-            try:
-                enriched.append(enrich_candidate(row))
-            except Exception as error:
-                failures.append({"code": row["code"], "error": str(error)})
-            common.update(
-                analyzed_count=len(enriched), processed_count=processed,
-                failed_count=len(failures), current_code=str(row["code"]),
-                current_company=str(row["company"]),
-            )
-            write_progress(
-                started, "analyzing_candidates", "候補銘柄を高度分析中",
-                40 + 55 * processed / max(target_count, 1), **common,
-            )
+        worker_count = min(4, max(1, int(os.getenv("PRIME_RANKING_WORKERS", "3"))))
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="prime-analysis") as executor:
+            futures = {
+                executor.submit(
+                    enrich_candidate, row, preloaded_by_code.get(str(row["code"])),
+                ): row
+                for _, row in candidates.iterrows()
+            }
+            for processed, future in enumerate(as_completed(futures), start=1):
+                row = futures[future]
+                try:
+                    enriched.append(future.result())
+                except Exception as error:
+                    failures.append({"code": row["code"], "error": str(error)})
+                common.update(
+                    analyzed_count=len(enriched), processed_count=processed,
+                    failed_count=len(failures), current_code=str(row["code"]),
+                    current_company=str(row["company"]),
+                )
+                write_progress(
+                    started, "analyzing_candidates", f"候補銘柄を{worker_count}並列で分析中",
+                    48 + 47 * processed / max(target_count, 1),
+                    worker_count=worker_count, **common,
+                )
         if not enriched:
             raise RuntimeError("all advanced candidate analyses failed")
         write_progress(started, "saving", "ランキングCSVを検証・保存中", 97, **common)

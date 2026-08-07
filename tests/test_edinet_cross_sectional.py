@@ -15,10 +15,18 @@ sys.path.insert(0, str(APP_DIR))
 
 from services.cross_sectional import run_cross_sectional_backtest  # noqa: E402
 from services.edinet import EdinetClient, _read_csv_package, extract_financial_metrics, get_fundamental_analysis, score_fundamentals  # noqa: E402
-from services.prime_ranking import atomic_replace_ranking, now_jst, parse_prime_universe, read_latest_ranking, read_status, screen_prime_universe  # noqa: E402
+from services.prime_ranking import _bulk_symbol_frame, atomic_replace_ranking, now_jst, parse_prime_universe, read_latest_ranking, read_status, screen_prime_universe, sector_etf_symbol  # noqa: E402
 
 
 class EdinetAndCrossSectionalTest(unittest.TestCase):
+    def test_bulk_market_data_is_split_and_sector_is_mapped(self):
+        columns = pd.MultiIndex.from_product([["Close", "Open"], ["5802.T", "^N225"]])
+        downloaded = pd.DataFrame([[100, 200, 99, 198]], columns=columns)
+        result = _bulk_symbol_frame(downloaded, "5802.T")
+        self.assertEqual(list(result.columns), ["Open", "Close"])
+        self.assertEqual(float(result.iloc[0]["Close"]), 100.0)
+        self.assertEqual(sector_etf_symbol("電気機器"), "1625.T")
+
     def test_jpx_prime_universe_excludes_other_markets(self):
         source = pd.DataFrame({
             "コード": ["58020", "12340", "99990"],

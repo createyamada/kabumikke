@@ -18,8 +18,12 @@ import numpy as np
 import pandas as pd
 import re
 import logging
+import os
+import pickle
+import threading
 from datetime import datetime
 from datetime import timedelta
+from pathlib import Path
 from library import format
 from library import config
 from services import edinet
@@ -79,7 +83,7 @@ def fetch_history(ticker, label, required=True, **kwargs):
     return pd.DataFrame()
 
 
-def get_analysis_data(company):
+def get_analysis_data(company, preloaded=None):
     """
     分析のためのデータを取得する
 
@@ -91,51 +95,72 @@ def get_analysis_data(company):
     """
     result = []
 
+    def supplied(key):
+        frame = preloaded.get(key) if preloaded else None
+        return frame.copy(deep=True) if isinstance(frame, pd.DataFrame) else None
+
     # 企業の株価時系列。空のまま市場指標だけを分析しないよう先に検証する。
-    company_history = fetch_history(company, "company")
+    company_history = supplied('company')
+    if company_history is None or company_history.empty:
+        company_history = fetch_history(company, "company")
     result.append(company_history)
 
 
     # 日経平均株価を取得する
-    nikkei = yf.Ticker("^N225")
-    nikkei_info = fetch_history(nikkei, "nikkei", prepost=True, actions=False)
+    nikkei_info = supplied('nikkei')
+    if nikkei_info is None or nikkei_info.empty:
+        nikkei = yf.Ticker("^N225")
+        nikkei_info = fetch_history(nikkei, "nikkei", prepost=True, actions=False)
     nikkei_info = nikkei_info[["Open", "Close"]]
     nikkei_info = nikkei_info.rename(columns={'Open': 'nikkei_open','Close': 'nikkei_close' })
     result.append(nikkei_info)
 
     # 東証全体の地合いを表すTOPIX。取得失敗時は後段で日経平均を代理にする。
-    topix = yf.Ticker("^TOPX")
-    topix_info = fetch_history(topix, "topix", required=False, prepost=True, actions=False)
+    topix_info = supplied('topix')
+    if topix_info is None or topix_info.empty:
+        topix = yf.Ticker("^TOPX")
+        topix_info = fetch_history(topix, "topix", required=False, prepost=True, actions=False)
     if not topix_info.empty:
         topix_info = topix_info[["Open", "Close"]]
         topix_info = topix_info.rename(columns={"Open": "topix_open", "Close": "topix_close"})
     result.append(topix_info)
 
-    sector_symbol, sector_name = resolve_sector_benchmark(company)
+    sector_symbol = preloaded.get('sector_symbol') if preloaded else None
+    sector_name = preloaded.get('sector_name') if preloaded else None
+    sector_info = supplied('sector')
+    if not preloaded:
+        sector_symbol, sector_name = resolve_sector_benchmark(company)
     if sector_symbol:
-        sector = yf.Ticker(sector_symbol)
-        sector_info = fetch_history(sector, "sector_benchmark", required=False, actions=False)
+        if sector_info is None or sector_info.empty:
+            sector = yf.Ticker(sector_symbol)
+            sector_info = fetch_history(sector, "sector_benchmark", required=False, actions=False)
         if not sector_info.empty:
             sector_info = sector_info[["Close"]].rename(columns={"Close": "sector_close"})
             result.append(sector_info)
 
     # ドル円を取得する
-    jpy = yf.Ticker("JPY=X")
-    jpy_info = fetch_history(jpy, "jpy", prepost=True, actions=False)
+    jpy_info = supplied('jpy')
+    if jpy_info is None or jpy_info.empty:
+        jpy = yf.Ticker("JPY=X")
+        jpy_info = fetch_history(jpy, "jpy", prepost=True, actions=False)
     jpy_info = jpy_info[["Open", "Close"]]
     jpy_info = jpy_info.rename(columns={'Open': 'jpy_open','Close': 'jpy_close' })
     result.append(jpy_info)
 
 
     # ニューヨークダウ平均株価を取得する
-    dow = yf.Ticker("^DJI")
-    dow_info = fetch_history(dow, "dow", actions=False)
+    dow_info = supplied('dow')
+    if dow_info is None or dow_info.empty:
+        dow = yf.Ticker("^DJI")
+        dow_info = fetch_history(dow, "dow", actions=False)
     dow_info = dow_info[["Open", "Close"]]
     dow_info = dow_info.rename(columns={'Open': 'dow_open','Close': 'dow_close' })
     result.append(dow_info)
 
-    mini_dow = yf.Ticker("YM=F")
-    mini_dow_info = fetch_history(mini_dow, "mini_dow", required=False, actions=False)
+    mini_dow_info = supplied('mini_dow')
+    if mini_dow_info is None or mini_dow_info.empty:
+        mini_dow = yf.Ticker("YM=F")
+        mini_dow_info = fetch_history(mini_dow, "mini_dow", required=False, actions=False)
     if not mini_dow_info.empty:
         mini_dow_info = mini_dow_info[["Open", "Close"]]
         mini_dow_info = mini_dow_info.rename(columns={'Open': 'mini_dow_open','Close': 'mini_dow_close' })
@@ -161,7 +186,35 @@ def get_analysis_data(company):
     return merged
 
 
-def get_prediction(code):
+def _model_cache_path(code, market_date):
+    root = Path(os.getenv('ANALYSIS_MODEL_CACHE_DIR', '.cache/models'))
+    return root / f'{code}_{market_date}_v2.joblib'
+
+
+def _load_cached_prediction(code, market_date):
+    if os.getenv('ANALYSIS_MODEL_CACHE_ENABLED', 'true').lower() not in {'1', 'true', 'yes'}:
+        return None
+    path = _model_cache_path(code, market_date)
+    try:
+        with path.open('rb') as cache_file:
+            payload = pickle.load(cache_file)
+        return payload.get('prediction') if payload.get('market_date') == market_date else None
+    except (OSError, ValueError, EOFError, KeyError, pickle.UnpicklingError):
+        return None
+
+
+def _save_cached_prediction(code, market_date, prediction):
+    if os.getenv('ANALYSIS_MODEL_CACHE_ENABLED', 'true').lower() not in {'1', 'true', 'yes'}:
+        return
+    path = _model_cache_path(code, market_date)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + f'.{os.getpid()}.{threading.get_ident()}.tmp')
+    with temporary.open('wb') as cache_file:
+        pickle.dump({'market_date': market_date, 'prediction': prediction}, cache_file)
+    os.replace(temporary, path)
+
+
+def get_prediction(code, preloaded=None, company_name=None):
     """
     コードから明日の株価の予想をする
 
@@ -179,20 +232,24 @@ def get_prediction(code):
     try :
 
         # 分析に必要な株価財務データを取得
-        datas = get_analysis_data(company)
+        datas = get_analysis_data(company, preloaded=preloaded)
 
         # 分析に必要な学習用、検証用データに分ける
         divided_datas = format.get_divided_data(datas)
-        price_prediction = price_predict(divided_datas)
-        try:
-            price_prediction['fundamental_analysis'] = edinet.get_fundamental_analysis(code)
-        except Exception:
-            logger.warning("EDINET analysis unavailable: code=%s", code, exc_info=True)
-            price_prediction['fundamental_analysis'] = {
-                'available': False,
-                'source': 'EDINET_API_v2',
-                'reason': 'temporary_fetch_or_parse_error',
-            }
+        market_date = str(datas.index[-1].date())
+        price_prediction = _load_cached_prediction(code, market_date)
+        if price_prediction is None:
+            price_prediction = price_predict(divided_datas)
+            try:
+                price_prediction['fundamental_analysis'] = edinet.get_fundamental_analysis(code)
+            except Exception:
+                logger.warning("EDINET analysis unavailable: code=%s", code, exc_info=True)
+                price_prediction['fundamental_analysis'] = {
+                    'available': False,
+                    'source': 'EDINET_API_v2',
+                    'reason': 'temporary_fetch_or_parse_error',
+                }
+            _save_cached_prediction(code, market_date, price_prediction)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
     except Exception as e:
@@ -203,7 +260,7 @@ def get_prediction(code):
         ) from e
 
     try:
-        company_name = company.info.get('longName', code)
+        company_name = company_name or company.info.get('longName', code)
     except Exception:
         # 会社名は表示用なので、取得失敗で分析結果を失わないようにする。
         company_name = code

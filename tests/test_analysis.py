@@ -1,6 +1,8 @@
 import sys
 import types
 import unittest
+import os
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -111,6 +113,8 @@ sys.modules.setdefault("sklearn.isotonic", isotonic)
 
 from library import config, format  # noqa: E402
 from services.analysis import (  # noqa: E402
+    _load_cached_prediction,
+    _save_cached_prediction,
     analyze_topology,
     create_delay_embedding,
     fetch_history,
@@ -129,6 +133,23 @@ class StockAnalysisTest(unittest.TestCase):
         data["Close"] = close
         data["Close_next"] = close.shift(-1)
         return data
+
+    def test_prediction_cache_is_reused_for_same_market_date(self):
+        previous = os.environ.get("ANALYSIS_MODEL_CACHE_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                os.environ["ANALYSIS_MODEL_CACHE_DIR"] = directory
+                expected = {"selected_model": "ridge", "score": 1.25}
+                _save_cached_prediction("5802", "2026-08-07", expected)
+                self.assertEqual(
+                    _load_cached_prediction("5802", "2026-08-07"), expected,
+                )
+                self.assertIsNone(_load_cached_prediction("5802", "2026-08-08"))
+        finally:
+            if previous is None:
+                os.environ.pop("ANALYSIS_MODEL_CACHE_DIR", None)
+            else:
+                os.environ["ANALYSIS_MODEL_CACHE_DIR"] = previous
 
     def test_division_preserves_order_and_provides_full_training_set(self):
         divided = format.get_divided_data(self.make_data())

@@ -6,7 +6,16 @@ JPXが公開する上場銘柄一覧からプライム内国普通株式を抽�
 
 ```text
 PRIME_RANKING_DIR=data/prime_ranking
+PRIME_RANKING_WORKERS=3
+ANALYSIS_MODEL_CACHE_ENABLED=true
+ANALYSIS_MODEL_CACHE_DIR=.cache/models
 ```
+
+`PRIME_RANKING_WORKERS`は候補銘柄の並列分析数です。無料データ取得サービスへの負荷を抑えるため1～4に制限され、既定値は3です。
+
+ランキングでは一次スクリーニング用に全銘柄の株価・出来高をまとめて取得し、高度分析へ進む候補についても10年分の株価、日経平均、TOPIX、為替、米国市場、業種ETFを一括取得して各ワーカーで共有します。
+
+分析結果は入力株価の最終取引日ごとに`ANALYSIS_MODEL_CACHE_DIR`へ保存されます。同じ銘柄・同じ最終取引日の再分析ではモデル学習を省略し、新しい取引日のデータが追加されると別のキャッシュが生成されます。
 
 JPXの一覧は月によって`.xls`または`.xlsx`で提供されるため、`requirements.txt`には`.xls`用の`xlrd`と`.xlsx`用の`openpyxl`を含めています。依存関係変更後は再インストールしてください。
 
@@ -14,7 +23,7 @@ JPXの一覧は月によって`.xls`または`.xlsx`で提供されるため、`
 pip install -r requirements.txt
 ```
 
-EDINET財務分析もランキングへ反映する場合は、`EDINET_API_KEY`も設定します。未設定でも株価・モデル・TDAによるランキングは生成できます。
+EDINET財務分析もランキングへ反映する場合は、`EDINET_API_KEY`も設定します。未設定でも株価・モデルによるランキングは生成できます。
 
 ## 更新開始
 
