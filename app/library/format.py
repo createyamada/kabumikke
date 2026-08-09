@@ -100,12 +100,13 @@ def merge_all_company_info(infos: list):
     merged_df.set_index(keys='Date', inplace=True)
     merged_df.sort_values(by='Date', ascending=True, inplace=True)
 
-    # 米国市場の当日値が未確定なら先物で補い、それもなければ直近値を使用する。
-    if pd.isna(merged_df.iloc[-1]['dow_open']):
-        if pd.notna(merged_df.iloc[-1].get('mini_dow_open')):
-            merged_df.loc[merged_df.index[-1], 'dow_open'] = merged_df.iloc[-1]['mini_dow_open']
-            merged_df.loc[merged_df.index[-1], 'dow_close'] = merged_df.iloc[-1]['mini_dow_close']
-    merged_df[['dow_open', 'dow_close']] = merged_df[['dow_open', 'dow_close']].ffill()
+    # 日本株の引け時点では同じ日付の米国終値と日次為替終値は未確定になり得る。
+    # 日付結合後に1行遅らせ、予測時点で確実に既知だった値だけを利用する。
+    # 米国先物の同日終値も確定時刻が曖昧なので、日次モデルには混ぜない。
+    for columns in (('dow_open', 'dow_close'), ('jpy_open', 'jpy_close')):
+        available = [column for column in columns if column in merged_df.columns]
+        if available:
+            merged_df[available] = merged_df[available].shift(1).ffill()
 
     merged_df['Body'] = (merged_df['Open'] - merged_df['Close']).fillna(0)
     merged_df['Close_diff'] = merged_df['Close'].diff(1).fillna(0)
@@ -292,8 +293,7 @@ def dataframe_index_to_clumn(data):
     Returns:
     - result 日付カラムを加えたデータフレーム
     """
-    data.reset_index(inplace=True)
-    result = data.rename(columns={'index': 'Date'})
+    result = data.reset_index().rename(columns={'index': 'Date'})
     # タイムゾーン情報を削除し、型を統一
     result['Date'] = pd.to_datetime(result['Date']).dt.tz_localize(None)
     return result

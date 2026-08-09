@@ -165,10 +165,18 @@ class StockAnalysisTest(unittest.TestCase):
         result = price_predict(divided)
 
         self.assertIn("baseline_return_rmse", result["metrics"])
+        self.assertIn("baseline_return_mae", result["metrics"])
+        self.assertIn("mase", result["metrics"])
+        self.assertIn("return_mase", result["metrics"])
         self.assertIn("directional_accuracy", result["metrics"])
         self.assertEqual(result["score"], result["metrics"]["rmse"])
         self.assertGreater(result["metrics"]["training_samples"], result["metrics"]["test_samples"])
         self.assertIn(result["selected_model"], result["model_comparison"])
+        self.assertIn("ridge", result["model_comparison"])
+        self.assertIn("gradient_boosting", result["model_comparison"])
+        self.assertTrue(result["feature_importance"])
+        self.assertIn("feature", result["feature_importance"][0])
+        self.assertIn("mse_increase", result["feature_importance"][0])
         self.assertIn("strategy_return", result["backtest"])
         self.assertIn("up_probability", result)
         self.assertIn("direction_classifier", result)
@@ -233,8 +241,40 @@ class StockAnalysisTest(unittest.TestCase):
             self.assertIn(column, original.columns)
             self.assertAlmostEqual(original[column].iloc[-2], changed_future[column].iloc[-2])
 
+    def test_same_day_us_and_fx_values_are_not_available_at_japan_close(self):
+        index = pd.bdate_range("2024-01-01", periods=90)
+        close = 100 + np.arange(len(index), dtype=float)
+
+        def build(last_external_adjustment=0):
+            frame = pd.DataFrame({
+                "Open": close - 0.2, "High": close + 1.0, "Low": close - 1.0,
+                "Close": close, "Volume": 100000 + np.arange(len(index)),
+                "nikkei_open": close, "nikkei_close": close,
+                "topix_open": close, "topix_close": close,
+                "dow_open": close * 10, "dow_close": close * 10,
+                "jpy_open": close / 2, "jpy_close": close / 2,
+            }, index=index)
+            frame.loc[index[-1], ["dow_open", "dow_close", "jpy_open", "jpy_close"]] += last_external_adjustment
+            return format.merge_all_company_info([frame])
+
+        original = build()
+        changed_unknown_values = build(last_external_adjustment=10000)
+        for column in ("dow_open", "dow_close", "jpy_open", "jpy_close", "dow_return", "jpy_return"):
+            self.assertAlmostEqual(original[column].iloc[-1], changed_unknown_values[column].iloc[-1])
+
     def test_next_weekday_skips_weekend(self):
         self.assertEqual(get_next_weekday("2026-08-07"), "2026-08-10")
+
+    def test_next_weekday_skips_jpx_holiday(self):
+        # 2026-08-11は山の日。
+        self.assertEqual(get_next_weekday("2026-08-10"), "2026-08-12")
+
+    def test_dataframe_index_conversion_does_not_mutate_input(self):
+        source = pd.DataFrame({"Close": [100.0]}, index=pd.to_datetime(["2026-08-10"]))
+        before = source.copy(deep=True)
+        converted = format.dataframe_index_to_clumn(source)
+        pd.testing.assert_frame_equal(source, before)
+        self.assertIn("Date", converted.columns)
 
     def test_market_data_fetch_retries_once(self):
         expected = pd.DataFrame({"Close": [100.0]})

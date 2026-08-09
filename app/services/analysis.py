@@ -188,7 +188,8 @@ def get_analysis_data(company, preloaded=None):
 
 def _model_cache_path(code, market_date):
     root = Path(os.getenv('ANALYSIS_MODEL_CACHE_DIR', '.cache/models'))
-    return root / f'{code}_{market_date}_v2.joblib'
+    # v3: 米国市場・為替のpoint-in-time遅延、MASE、特徴量重要度を含む。
+    return root / f'{code}_{market_date}_v3.joblib'
 
 
 def _load_cached_prediction(code, market_date):
@@ -307,6 +308,27 @@ def compare_models_walk_forward(features, target, columns, horizon=1):
 
     selected_name = min(comparison, key=lambda name: comparison[name]['walk_forward_rmse'])
     return selected_name, comparison
+
+
+def calculate_permutation_importance(model, features, target, columns, top_n=15):
+    """ホールドアウト誤差の増加量でモデル非依存の特徴量重要度を算出する。"""
+    if features.empty:
+        return []
+    X = features[columns].copy()
+    actual = np.asarray(target, dtype=float)
+    baseline = float(mse(actual, model.predict(X)))
+    random = np.random.default_rng(42)
+    importance = []
+    for column in columns:
+        shuffled = X.copy()
+        shuffled[column] = random.permutation(shuffled[column].to_numpy())
+        shuffled_error = float(mse(actual, model.predict(shuffled)))
+        importance.append({
+            'feature': column,
+            'mse_increase': float(shuffled_error - baseline),
+        })
+    importance.sort(key=lambda item: item['mse_increase'], reverse=True)
+    return importance[:top_n]
 
 
 def calculate_backtest(actual_returns, predicted_returns):
@@ -957,6 +979,8 @@ def price_predict(divided_datas):
     return_mae = np.mean(np.abs(actual.to_numpy() - Y_pred))
     baseline_pred = np.zeros(len(actual))
     baseline_score = np.sqrt(mse(actual, baseline_pred))
+    baseline_return_mae = np.mean(np.abs(actual.to_numpy() - baseline_pred))
+    return_mase = return_mae / baseline_return_mae if baseline_return_mae else None
     actual_direction = np.sign(actual.to_numpy())
     predicted_direction = np.sign(Y_pred)
     directional_accuracy = np.mean(actual_direction == predicted_direction)
@@ -969,6 +993,13 @@ def price_predict(divided_datas):
         )
         holdout_prediction = holdout_model.predict(divided_datas['X_test'][available_columns])
         model_comparison[name]['holdout_rmse'] = float(np.sqrt(mse(actual, holdout_prediction)))
+
+    feature_importance = calculate_permutation_importance(
+        evaluation_model,
+        divided_datas['X_test'],
+        actual,
+        available_columns,
+    )
 
     current_close = divided_datas['current_close_test'].to_numpy()
     predicted_close = current_close * (1 + Y_pred)
@@ -1057,7 +1088,10 @@ def price_predict(divided_datas):
         'baseline_rmse': float(baseline_price_score),
         'return_rmse': float(return_score),
         'return_mae': float(return_mae),
+        'mase': float(return_mase) if return_mase is not None else None,
+        'return_mase': float(return_mase) if return_mase is not None else None,
         'baseline_return_rmse': float(baseline_score),
+        'baseline_return_mae': float(baseline_return_mae),
         'rmse_improvement_rate': (
             float(1 - return_score / baseline_score) if baseline_score else 0.0
         ),
@@ -1123,6 +1157,7 @@ def price_predict(divided_datas):
         'prediction_interval': prediction_interval,
         'interval_evaluation': interval_evaluation,
         'model_comparison': model_comparison,
+        'feature_importance': feature_importance,
         'backtest': backtest,
         'topological_analysis': topology,
         'topological_analysis_multi_window': topology_multi_window,
@@ -1141,14 +1176,20 @@ def get_next_weekday(date_str):
     - result: str (YYYY-MM-DD形式の翌営業日)
     """
 
-    # 文字列を datetime に変換
-    date = datetime.strptime(date_str, '%Y-%m-%d')
+    date = pd.Timestamp(datetime.strptime(date_str, '%Y-%m-%d')).normalize()
+    try:
+        import exchange_calendars as xcals
+        calendar = xcals.get_calendar('XTKS')
+        sessions = calendar.sessions_in_range(
+            date + pd.Timedelta(days=1),
+            date + pd.Timedelta(days=14),
+        )
+        if len(sessions):
+            return sessions[0].strftime('%Y-%m-%d')
+    except (ImportError, KeyError, ValueError):
+        logger.warning('JPX calendar unavailable; falling back to weekdays', exc_info=True)
 
-    # 翌日を計算
     next_day = date + timedelta(days=1)
-
-    # 土日なら次の平日まで進める
     while next_day.weekday() in [5, 6]:
         next_day += timedelta(days=1)
-
     return next_day.strftime('%Y-%m-%d')

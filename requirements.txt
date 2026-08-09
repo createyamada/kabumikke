@@ -8,6 +8,7 @@ python-jose
 python-multipart
 python-dotenv
 scikit-learn
+exchange-calendars
 ripser==0.6.15
 requests
 passlib
