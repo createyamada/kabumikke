@@ -5,17 +5,26 @@ JPXが公開する上場銘柄一覧からプライム内国普通株式を抽�
 ## 設定
 
 ```text
+DATABASE_URL=postgresql://user:password@host:5432/database
+DATABASE_RETRY_SECONDS=60
 PRIME_RANKING_DIR=data/prime_ranking
 PRIME_RANKING_WORKERS=3
+PRIME_PROGRESS_WRITE_INTERVAL_SECONDS=1
 ANALYSIS_MODEL_CACHE_ENABLED=true
 ANALYSIS_MODEL_CACHE_DIR=.cache/models
 ```
 
+`DATABASE_URL`が設定されている場合、ランキング本体、処理ステータス、プライム銘柄一覧、当日分析キャッシュをDBへ保存します。初回接続時に`kabumikke_store`テーブルを自動作成します。DB未設定または一時的な接続障害の場合は、従来のCSV・JSON・キャッシュファイルを使用します。
+
 `PRIME_RANKING_WORKERS`は候補銘柄の並列分析数です。無料データ取得サービスへの負荷を抑えるため1～4に制限され、既定値は3です。
+
+進捗は画面の表示精度を維持したまま、同一工程では既定1秒間隔または1ポイント以上進んだ場合に保存します。PostgreSQL/SQLiteでは更新をUPSERT 1回で処理します。
 
 ランキングでは一次スクリーニング用に全銘柄の株価・出来高をまとめて取得し、高度分析へ進む候補についても10年分の株価、日経平均、TOPIX、為替、米国市場、業種ETFを一括取得して各ワーカーで共有します。
 
 分析結果は入力株価の最終取引日ごとに`ANALYSIS_MODEL_CACHE_DIR`へ保存されます。同じ銘柄・同じ最終取引日の再分析ではモデル学習を省略し、新しい取引日のデータが追加されると別のキャッシュが生成されます。
+
+DB利用時は分析結果の確認を市場データ取得より先に行います。また、同日分の市場履歴・前処理済み特徴量・ランキング用市場行列も再利用します。分析バージョンまたは特徴量バージョンが変わった場合は別キーになるため、古い計算結果が新しい分析へ混入しません。
 
 JPXの一覧は月によって`.xls`または`.xlsx`で提供されるため、`requirements.txt`には`.xls`用の`xlrd`と`.xlsx`用の`openpyxl`を含めています。依存関係変更後は再インストールしてください。
 

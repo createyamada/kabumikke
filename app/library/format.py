@@ -72,6 +72,9 @@ def merge_all_company_info(infos: list):
     merged_df = None
 
     for index, info in enumerate(infos):
+        # Callers may share benchmark frames across ranking workers.
+        # Keep feature construction side-effect free without deep-copying all inputs.
+        info = info.copy(deep=False)
         if info.empty:
             print(f"Warning: DataFrame at index {index} is empty. Skipping...")
             continue

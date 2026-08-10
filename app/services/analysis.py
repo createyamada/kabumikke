@@ -26,12 +26,14 @@ from datetime import timedelta
 from pathlib import Path
 from library import format
 from library import config
-from services import edinet
+from services import database, edinet
 import yfinance as yf
 
 
 logger = logging.getLogger(__name__)
 HISTORY_PERIOD = "10y"
+ANALYSIS_CACHE_VERSION = "v4"
+FEATURE_CACHE_VERSION = "v1"
 
 SECTOR_ETF_BY_KEYWORD = {
     'food': '1617.T', 'energy': '1618.T', 'oil': '1618.T',
@@ -44,6 +46,86 @@ SECTOR_ETF_BY_KEYWORD = {
     'wholesale': '1629.T', 'retail': '1630.T', 'bank': '1631.T',
     'financial': '1632.T', 'insurance': '1632.T', 'real estate': '1633.T',
 }
+
+
+def _is_jpx_fallback_holiday(day):
+    """Conservative JPX holiday fallback used only without exchange_calendars."""
+    import calendar
+
+    month_day = (day.month, day.day)
+    if month_day in {
+        (1, 1), (1, 2), (1, 3), (2, 11), (2, 23), (4, 29),
+        (5, 3), (5, 4), (5, 5), (8, 11), (11, 3), (11, 23), (12, 31),
+    }:
+        return True
+    occurrence = (day.day - 1) // 7 + 1
+    if day.weekday() == calendar.MONDAY and (
+        (day.month, occurrence) in {(1, 2), (7, 3), (9, 3), (10, 2)}
+    ):
+        return True
+    # Approximate equinox dates supported by the production calendar dependency.
+    if day.month == 3 and day.day in {20, 21}:
+        return True
+    if day.month == 9 and day.day in {22, 23}:
+        return True
+    previous = day - timedelta(days=1)
+    if previous.weekday() == 6 and (previous.month, previous.day) in {
+        (2, 11), (2, 23), (4, 29), (5, 3), (5, 4), (5, 5),
+        (8, 11), (11, 3), (11, 23),
+    }:
+        return True
+    return False
+
+
+def latest_completed_market_date(now=None):
+    """Return the latest JPX session whose 15:30 JST close has passed."""
+    from zoneinfo import ZoneInfo
+
+    current = now or datetime.now(ZoneInfo("Asia/Tokyo"))
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=ZoneInfo("Asia/Tokyo"))
+    cutoff_date = current.date()
+    if (current.hour, current.minute) < (15, 30):
+        cutoff_date -= timedelta(days=1)
+    try:
+        import exchange_calendars as xcals
+        calendar = xcals.get_calendar('XTKS')
+        sessions = calendar.sessions_in_range(
+            pd.Timestamp(cutoff_date) - pd.Timedelta(days=20),
+            pd.Timestamp(cutoff_date),
+        )
+        if len(sessions):
+            return sessions[-1].strftime('%Y-%m-%d')
+    except Exception:
+        logger.debug("JPX calendar unavailable for cache date", exc_info=True)
+    while cutoff_date.weekday() >= 5 or _is_jpx_fallback_holiday(cutoff_date):
+        cutoff_date -= timedelta(days=1)
+    return cutoff_date.isoformat()
+
+
+def _history_cache_key(symbol, market_date):
+    return f"{symbol}:{market_date}:{HISTORY_PERIOD}:adjusted"
+
+
+def _load_market_history(symbol, market_date):
+    payload = database.get_bytes("market_history", _history_cache_key(symbol, market_date))
+    if payload is None:
+        return None
+    try:
+        frame = pickle.loads(payload)
+        return frame if isinstance(frame, pd.DataFrame) and not frame.empty else None
+    except (ValueError, EOFError, pickle.UnpicklingError):
+        logger.warning("invalid market history cache: symbol=%s", symbol, exc_info=True)
+        return None
+
+
+def _save_market_history(symbol, history):
+    if history is None or history.empty:
+        return
+    actual_date = str(pd.Timestamp(history.index[-1]).date())
+    database.put_bytes(
+        "market_history", _history_cache_key(symbol, actual_date), pickle.dumps(history),
+    )
 
 
 def resolve_sector_benchmark(company):
@@ -61,11 +143,16 @@ def resolve_sector_benchmark(company):
 
 def fetch_history(ticker, label, required=True, **kwargs):
     """yfinanceの一時的な取得失敗を1回だけ再試行する。"""
+    symbol = str(getattr(ticker, "ticker", label))
+    cached = _load_market_history(symbol, latest_completed_market_date())
+    if cached is not None:
+        return cached.copy(deep=False)
     last_error = None
     for attempt in range(2):
         try:
             history = ticker.history(period=HISTORY_PERIOD, **kwargs)
             if history is not None and not history.empty:
+                _save_market_history(symbol, history)
                 return history
             last_error = RuntimeError(f"{label}の履歴が空です。")
         except Exception as error:
@@ -97,7 +184,7 @@ def get_analysis_data(company, preloaded=None):
 
     def supplied(key):
         frame = preloaded.get(key) if preloaded else None
-        return frame.copy(deep=True) if isinstance(frame, pd.DataFrame) else None
+        return frame if isinstance(frame, pd.DataFrame) else None
 
     # 企業の株価時系列。空のまま市場指標だけを分析しないよう先に検証する。
     company_history = supplied('company')
@@ -188,31 +275,78 @@ def get_analysis_data(company, preloaded=None):
 
 def _model_cache_path(code, market_date):
     root = Path(os.getenv('ANALYSIS_MODEL_CACHE_DIR', '.cache/models'))
-    # v3: 米国市場・為替のpoint-in-time遅延、MASE、特徴量重要度を含む。
-    return root / f'{code}_{market_date}_v3.joblib'
+    return root / f'{code}_{market_date}_{ANALYSIS_CACHE_VERSION}.joblib'
 
 
-def _load_cached_prediction(code, market_date):
+def _load_cached_payload(code, market_date):
     if os.getenv('ANALYSIS_MODEL_CACHE_ENABLED', 'true').lower() not in {'1', 'true', 'yes'}:
         return None
+    cache_key = f'{code}:{market_date}:{ANALYSIS_CACHE_VERSION}'
+    database_payload = database.get_bytes('analysis_cache', cache_key)
+    if database_payload is not None:
+        try:
+            payload = pickle.loads(database_payload)
+            return payload if payload.get('market_date') == market_date else None
+        except (ValueError, EOFError, KeyError, pickle.UnpicklingError):
+            logger.warning("invalid analysis cache in database: key=%s", cache_key, exc_info=True)
     path = _model_cache_path(code, market_date)
     try:
         with path.open('rb') as cache_file:
             payload = pickle.load(cache_file)
-        return payload.get('prediction') if payload.get('market_date') == market_date else None
+        return payload if payload.get('market_date') == market_date else None
     except (OSError, ValueError, EOFError, KeyError, pickle.UnpicklingError):
         return None
 
 
-def _save_cached_prediction(code, market_date, prediction):
+def _load_cached_prediction(code, market_date):
+    payload = _load_cached_payload(code, market_date)
+    return payload.get('prediction') if payload else None
+
+
+def _save_cached_prediction(code, market_date, prediction, company_name=None):
     if os.getenv('ANALYSIS_MODEL_CACHE_ENABLED', 'true').lower() not in {'1', 'true', 'yes'}:
+        return
+    payload = {
+        'market_date': market_date,
+        'prediction': prediction,
+        'company_name': company_name,
+        'analysis_version': ANALYSIS_CACHE_VERSION,
+    }
+    cache_key = f'{code}:{market_date}:{ANALYSIS_CACHE_VERSION}'
+    if database.put_bytes('analysis_cache', cache_key, pickle.dumps(payload)):
+        database.put_json('analysis_cache_index', code, {
+            'market_date': market_date,
+            'analysis_version': ANALYSIS_CACHE_VERSION,
+        })
         return
     path = _model_cache_path(code, market_date)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + f'.{os.getpid()}.{threading.get_ident()}.tmp')
     with temporary.open('wb') as cache_file:
-        pickle.dump({'market_date': market_date, 'prediction': prediction}, cache_file)
+        pickle.dump(payload, cache_file)
     os.replace(temporary, path)
+
+
+def _feature_cache_key(code, market_date):
+    return f'{code}:{market_date}:{FEATURE_CACHE_VERSION}'
+
+
+def _load_cached_features(code, market_date):
+    payload = database.get_bytes('feature_cache', _feature_cache_key(code, market_date))
+    if payload is None:
+        return None
+    try:
+        data = pickle.loads(payload)
+        return data if isinstance(data, pd.DataFrame) and not data.empty else None
+    except (ValueError, EOFError, pickle.UnpicklingError):
+        logger.warning("invalid feature cache: code=%s date=%s", code, market_date, exc_info=True)
+        return None
+
+
+def _save_cached_features(code, market_date, data):
+    database.put_bytes(
+        'feature_cache', _feature_cache_key(code, market_date), pickle.dumps(data),
+    )
 
 
 def get_prediction(code, preloaded=None, company_name=None):
@@ -228,18 +362,30 @@ def get_prediction(code, preloaded=None, company_name=None):
     if not re.fullmatch(r"\d{4}", code):
         raise HTTPException(status_code=422, detail="銘柄コードは4桁の数字で指定してください。")
 
+    expected_market_date = latest_completed_market_date()
+    cached_payload = _load_cached_payload(code, expected_market_date)
+    if cached_payload is not None:
+        return {
+            'prediction': cached_payload['prediction'],
+            'company': company_name or cached_payload.get('company_name') or code,
+        }
+
     company = yf.Ticker(code + ".T")
+    calculated = False
 
     try :
-
-        # 分析に必要な株価財務データを取得
-        datas = get_analysis_data(company, preloaded=preloaded)
+        datas = _load_cached_features(code, expected_market_date)
+        if datas is None:
+            # 分析に必要な株価財務データを取得
+            datas = get_analysis_data(company, preloaded=preloaded)
+            feature_market_date = str(datas.index[-1].date())
+            _save_cached_features(code, feature_market_date, datas)
 
         # 分析に必要な学習用、検証用データに分ける
         divided_datas = format.get_divided_data(datas)
         market_date = str(datas.index[-1].date())
-        price_prediction = _load_cached_prediction(code, market_date)
-        if price_prediction is None:
+        cached_payload = _load_cached_payload(code, market_date)
+        if cached_payload is None:
             price_prediction = price_predict(divided_datas)
             try:
                 price_prediction['fundamental_analysis'] = edinet.get_fundamental_analysis(code)
@@ -250,7 +396,9 @@ def get_prediction(code, preloaded=None, company_name=None):
                     'source': 'EDINET_API_v2',
                     'reason': 'temporary_fetch_or_parse_error',
                 }
-            _save_cached_prediction(code, market_date, price_prediction)
+            calculated = True
+        else:
+            price_prediction = cached_payload['prediction']
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
     except Exception as e:
@@ -261,10 +409,13 @@ def get_prediction(code, preloaded=None, company_name=None):
         ) from e
 
     try:
-        company_name = company_name or company.info.get('longName', code)
+        company_name = company_name or (cached_payload.get('company_name') if cached_payload else None) or company.info.get('longName', code)
     except Exception:
         # 会社名は表示用なので、取得失敗で分析結果を失わないようにする。
         company_name = code
+
+    if calculated:
+        _save_cached_prediction(code, market_date, price_prediction, company_name=company_name)
 
     # 予測を行う
     return {
@@ -292,13 +443,14 @@ def compare_models_walk_forward(features, target, columns, horizon=1):
     split_count = min(5, max(2, len(features) // 60))
     splitter = TimeSeriesSplit(n_splits=split_count, gap=max(1, int(horizon)))
     comparison = {}
+    selected_features = features[columns]
 
     for name, factory in get_candidate_models().items():
         fold_scores = []
-        for train_indices, valid_indices in splitter.split(features):
+        for train_indices, valid_indices in splitter.split(selected_features):
             model = factory()
-            model.fit(features.iloc[train_indices][columns], target.iloc[train_indices])
-            prediction = model.predict(features.iloc[valid_indices][columns])
+            model.fit(selected_features.iloc[train_indices], target.iloc[train_indices])
+            prediction = model.predict(selected_features.iloc[valid_indices])
             fold_scores.append(float(np.sqrt(mse(target.iloc[valid_indices], prediction))))
         comparison[name] = {
             'walk_forward_rmse': float(np.mean(fold_scores)),
@@ -964,17 +1116,25 @@ def price_predict(divided_datas):
         available_columns,
         horizon=1,
     )
-    evaluation_model = get_candidate_models()[selected_model]()
-    evaluation_model.fit(
-        divided_datas['X_train'][available_columns],
-        divided_datas['Y_train'],
-    )
+    actual = divided_datas['Y_test']
+    holdout_models = {}
+    holdout_predictions = {}
+    for name, factory in get_candidate_models().items():
+        holdout_model = factory()
+        holdout_model.fit(
+            divided_datas['X_train'][available_columns],
+            divided_datas['Y_train'],
+        )
+        holdout_prediction = holdout_model.predict(divided_datas['X_test'][available_columns])
+        holdout_models[name] = holdout_model
+        holdout_predictions[name] = holdout_prediction
+        model_comparison[name]['holdout_rmse'] = float(np.sqrt(mse(actual, holdout_prediction)))
 
-    # テストデータにて予測する
-    Y_pred = evaluation_model.predict(divided_datas['X_test'][available_columns])
+    # The selected holdout model was already fitted on exactly the same rows.
+    evaluation_model = holdout_models[selected_model]
+    Y_pred = holdout_predictions[selected_model]
 
     # 収益率として評価する。ゼロは「価格変化なし」の単純予測。
-    actual = divided_datas['Y_test']
     return_score = np.sqrt(mse(actual, Y_pred))
     return_mae = np.mean(np.abs(actual.to_numpy() - Y_pred))
     baseline_pred = np.zeros(len(actual))
@@ -984,15 +1144,6 @@ def price_predict(divided_datas):
     actual_direction = np.sign(actual.to_numpy())
     predicted_direction = np.sign(Y_pred)
     directional_accuracy = np.mean(actual_direction == predicted_direction)
-
-    for name, factory in get_candidate_models().items():
-        holdout_model = factory()
-        holdout_model.fit(
-            divided_datas['X_train'][available_columns],
-            divided_datas['Y_train'],
-        )
-        holdout_prediction = holdout_model.predict(divided_datas['X_test'][available_columns])
-        model_comparison[name]['holdout_rmse'] = float(np.sqrt(mse(actual, holdout_prediction)))
 
     feature_importance = calculate_permutation_importance(
         evaluation_model,
@@ -1190,6 +1341,6 @@ def get_next_weekday(date_str):
         logger.warning('JPX calendar unavailable; falling back to weekdays', exc_info=True)
 
     next_day = date + timedelta(days=1)
-    while next_day.weekday() in [5, 6]:
+    while next_day.weekday() in [5, 6] or _is_jpx_fallback_holiday(next_day.date()):
         next_day += timedelta(days=1)
     return next_day.strftime('%Y-%m-%d')

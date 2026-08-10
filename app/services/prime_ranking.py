@@ -1,8 +1,10 @@
 """TSE Prime universe screening with an atomic latest-only CSV store."""
 import io
+import hashlib
 import json
 import multiprocessing
 import os
+import pickle
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,12 +16,14 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-from services import analysis
+from services import analysis, database
 
 
 JPX_LIST_PAGE = "https://www.jpx.co.jp/markets/statistics-equities/misc/01.html"
 REQUIRED_COLUMNS = {"rank", "code", "company", "total_score", "analyzed_at"}
 _worker_lock = threading.Lock()
+_progress_write_lock = threading.Lock()
+_last_progress_write = {}
 JST = ZoneInfo("Asia/Tokyo")
 
 SECTOR_ETF_RULES = (
@@ -48,6 +52,9 @@ def now_jst():
 
 
 def latest_ranking_date():
+    stored = database.get_json("prime_ranking", "latest")
+    if stored and stored.get("generated_date"):
+        return str(stored["generated_date"])
     path = ranking_paths()["latest"]
     if not path.exists():
         return None
@@ -99,6 +106,7 @@ def atomic_write_text(path, text):
 
 def write_status(status, **values):
     payload = {"status": status, **values}
+    database.put_json("prime_ranking", "status", payload)
     atomic_write_text(ranking_paths()["status"], json.dumps(payload, ensure_ascii=False, indent=2))
     return payload
 
@@ -117,21 +125,42 @@ def write_progress(started_at, phase, phase_label, progress_percent, **values):
     if 1 <= progress < 100 and elapsed > 0:
         remaining = max(0, round(elapsed * (100 - progress) / progress))
         estimated_completion = (now + timedelta(seconds=remaining)).isoformat()
-    return write_status(
-        "running",
-        started_at=started_at,
-        updated_at=now.isoformat(),
-        phase=phase,
-        phase_label=phase_label,
-        progress_percent=round(progress, 1),
-        elapsed_seconds=round(elapsed),
-        estimated_remaining_seconds=remaining,
-        estimated_completion_at=estimated_completion,
+    payload = {
+        "status": "running",
+        "started_at": started_at,
+        "updated_at": now.isoformat(),
+        "phase": phase,
+        "phase_label": phase_label,
+        "progress_percent": round(progress, 1),
+        "elapsed_seconds": round(elapsed),
+        "estimated_remaining_seconds": remaining,
+        "estimated_completion_at": estimated_completion,
         **values,
-    )
+    }
+    minimum_interval = max(0.25, float(os.getenv("PRIME_PROGRESS_WRITE_INTERVAL_SECONDS", "1")))
+    with _progress_write_lock:
+        previous = _last_progress_write.get(started_at)
+        should_write = (
+            previous is None
+            or previous["phase"] != phase
+            or progress - previous["progress"] >= 1.0
+            or elapsed - previous["elapsed"] >= minimum_interval
+        )
+        if not should_write:
+            return payload
+        _last_progress_write[started_at] = {
+            "phase": phase, "progress": progress, "elapsed": elapsed,
+        }
+    return write_status("running", **{key: value for key, value in payload.items() if key != "status"})
 
 
 def read_status():
+    stored = database.get_json("prime_ranking", "status")
+    if stored is not None:
+        stored["latest_csv_exists"] = ranking_paths()["latest"].exists()
+        stored["storage_backend"] = "database"
+        stored.update(refresh_availability())
+        return stored
     path = ranking_paths()["status"]
     if not path.exists():
         return {
@@ -141,6 +170,7 @@ def read_status():
         }
     payload = json.loads(path.read_text(encoding="utf-8"))
     payload["latest_csv_exists"] = ranking_paths()["latest"].exists()
+    payload["storage_backend"] = "file"
     payload.update(refresh_availability())
     return payload
 
@@ -194,7 +224,18 @@ def parse_prime_universe(frame):
 
 
 def fetch_prime_universe():
-    universe = parse_prime_universe(pd.read_excel(io.BytesIO(_download_jpx_excel())))
+    try:
+        universe = parse_prime_universe(pd.read_excel(io.BytesIO(_download_jpx_excel())))
+    except Exception:
+        stored = database.get_json("prime_ranking", "universe")
+        if not stored or not stored.get("records"):
+            raise
+        universe = pd.DataFrame(stored["records"])
+        universe["code"] = universe["code"].astype(str).str.zfill(4)
+    database.put_json(
+        "prime_ranking", "universe",
+        {"records": json.loads(universe.to_json(orient="records", force_ascii=False))},
+    )
     path = ranking_paths()["universe"]
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".csv.tmp")
@@ -220,6 +261,19 @@ def _extract_field(downloaded, field, symbols=None):
 def download_market_matrices(codes, period="2y", chunk_size=100, progress_callback=None):
     import yfinance as yf
 
+    expected_date = analysis.latest_completed_market_date()
+    universe_digest = hashlib.sha256(",".join(map(str, codes)).encode("utf-8")).hexdigest()[:16]
+    cache_key = f"{expected_date}:{period}:{universe_digest}"
+    cached_payload = database.get_bytes("prime_market_matrices", cache_key)
+    if cached_payload is not None:
+        try:
+            close, volume, topix = pickle.loads(cached_payload)
+            if progress_callback:
+                progress_callback(1, 1)
+            return close, volume, topix
+        except (ValueError, EOFError, pickle.UnpicklingError):
+            pass
+
     closes = []
     volumes = []
     symbols = [f"{code}.T" for code in codes]
@@ -244,6 +298,9 @@ def download_market_matrices(codes, period="2y", chunk_size=100, progress_callba
                 break
         except Exception:
             continue
+    database.put_bytes(
+        "prime_market_matrices", cache_key, pickle.dumps((close, volume, topix)),
+    )
     return close, volume, topix
 
 
@@ -281,11 +338,22 @@ def download_candidate_analysis_data(candidates, period=None):
     sector_symbols.discard(None)
     common_symbols = {"^N225", "^TOPX", "1306.T", "JPY=X", "^DJI", "YM=F"}
     symbols = [f"{row['code']}.T" for row in rows] + sorted(common_symbols | sector_symbols)
-    downloaded = yf.download(
-        symbols, period=period, auto_adjust=True, progress=False,
-        threads=True, group_by="column",
-    )
-    histories = {symbol: _bulk_symbol_frame(downloaded, symbol) for symbol in symbols}
+    expected_date = analysis.latest_completed_market_date()
+    histories = {
+        symbol: analysis._load_market_history(symbol, expected_date)
+        for symbol in symbols
+    }
+    missing_symbols = [symbol for symbol, frame in histories.items() if frame is None or frame.empty]
+    if missing_symbols:
+        downloaded = yf.download(
+            missing_symbols, period=period, auto_adjust=True, progress=False,
+            threads=True, group_by="column",
+        )
+        for symbol in missing_symbols:
+            frame = _bulk_symbol_frame(downloaded, symbol)
+            histories[symbol] = frame
+            analysis._save_market_history(symbol, frame)
+    histories = {symbol: frame if frame is not None else pd.DataFrame() for symbol, frame in histories.items()}
     topix = histories.get("^TOPX")
     if topix is None or topix.empty:
         topix = histories.get("1306.T", pd.DataFrame())
@@ -431,6 +499,14 @@ def atomic_replace_ranking(frame):
         raise ValueError("ranking CSV ordering or uniqueness validation failed")
     paths["latest"].parent.mkdir(parents=True, exist_ok=True)
     os.replace(paths["temporary"], paths["latest"])
+    database.put_json(
+        "prime_ranking", "latest",
+        {
+            "generated_date": str(verified["generated_date"].iloc[0]) if "generated_date" in verified else None,
+            "generated_at": str(verified["analyzed_at"].iloc[0]),
+            "records": json.loads(verified.to_json(orient="records", force_ascii=False)),
+        },
+    )
 
 
 def build_prime_ranking(limit=10, shortlist_size=50):
@@ -465,6 +541,10 @@ def build_prime_ranking(limit=10, shortlist_size=50):
         enriched = []
         failures = []
         worker_count = min(4, max(1, int(os.getenv("PRIME_RANKING_WORKERS", "3"))))
+        if multiprocessing.current_process().name == "prime-ranking-refresh" and worker_count > 1:
+            # Prevent each candidate worker from creating another full BLAS thread pool.
+            from threadpoolctl import threadpool_limits
+            threadpool_limits(limits=1)
         with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="prime-analysis") as executor:
             futures = {
                 executor.submit(
@@ -570,6 +650,27 @@ def start_prime_ranking_refresh(limit=10, shortlist_size=50):
 
 
 def read_latest_ranking(limit=10):
+    stored = database.get_json("prime_ranking", "latest")
+    if stored and stored.get("records"):
+        records = stored["records"][:limit]
+        for record in records:
+            record["code"] = str(record.get("code", "")).zfill(4)
+            for column in ("positive_factors", "risk_factors"):
+                value = record.get(column)
+                if isinstance(value, str):
+                    record[column] = json.loads(value)
+                elif value is None:
+                    record[column] = []
+        status = read_status()
+        return {
+            "available": True,
+            "generated_at": stored.get("generated_at"),
+            "source": "database",
+            "universe_count": status.get("universe_count"),
+            "analyzed_count": status.get("analyzed_count"),
+            **refresh_availability(),
+            "ranking": records,
+        }
     path = ranking_paths()["latest"]
     if not path.exists():
         return {"available": False, "reason": "ranking_not_generated", "ranking": []}

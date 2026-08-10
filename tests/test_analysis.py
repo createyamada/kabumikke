@@ -118,6 +118,8 @@ from services.analysis import (  # noqa: E402
     analyze_topology,
     create_delay_embedding,
     fetch_history,
+    get_prediction,
+    latest_completed_market_date,
     get_next_weekday,
     price_predict,
 )
@@ -145,6 +147,25 @@ class StockAnalysisTest(unittest.TestCase):
                     _load_cached_prediction("5802", "2026-08-07"), expected,
                 )
                 self.assertIsNone(_load_cached_prediction("5802", "2026-08-08"))
+        finally:
+            if previous is None:
+                os.environ.pop("ANALYSIS_MODEL_CACHE_DIR", None)
+            else:
+                os.environ["ANALYSIS_MODEL_CACHE_DIR"] = previous
+
+    def test_current_session_cache_returns_before_yfinance_access(self):
+        previous = os.environ.get("ANALYSIS_MODEL_CACHE_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                os.environ["ANALYSIS_MODEL_CACHE_DIR"] = directory
+                market_date = latest_completed_market_date()
+                expected = {"selected_model": "ridge", "score": 1.25}
+                _save_cached_prediction(
+                    "5802", market_date, expected, company_name="Cached Company",
+                )
+                result = get_prediction("5802")
+                self.assertEqual(result["prediction"], expected)
+                self.assertEqual(result["company"], "Cached Company")
         finally:
             if previous is None:
                 os.environ.pop("ANALYSIS_MODEL_CACHE_DIR", None)

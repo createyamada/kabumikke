@@ -14,3 +14,5 @@ requests
 passlib
 yfinance
 pytz
+SQLAlchemy>=1.4,<3
+psycopg2-binary>=2.9
