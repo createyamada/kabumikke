@@ -28,6 +28,8 @@ def _normalized_url():
     url = os.getenv("DATABASE_URL", "").strip()
     if url.startswith("postgres://"):
         return "postgresql://" + url[len("postgres://"):]
+    if url.startswith("mysql://"):
+        return "mysql+pymysql://" + url[len("mysql://"):]
     return url
 
 
@@ -89,6 +91,15 @@ def _put(namespace, key, json_payload=None, binary_payload=None):
                 statement = insert(table).values(**values).on_conflict_do_update(
                     index_elements=[table.c.namespace, table.c.item_key],
                     set_={name: value for name, value in values.items() if name not in {"namespace", "item_key"}},
+                )
+                connection.execute(statement)
+            elif engine.dialect.name in {"mysql", "mariadb"}:
+                from sqlalchemy.dialects.mysql import insert
+                statement = insert(table).values(**values)
+                statement = statement.on_duplicate_key_update(
+                    payload_json=statement.inserted.payload_json,
+                    payload_binary=statement.inserted.payload_binary,
+                    updated_at=statement.inserted.updated_at,
                 )
                 connection.execute(statement)
             else:

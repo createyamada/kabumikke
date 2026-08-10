@@ -14,6 +14,8 @@ ANALYSIS_MODEL_CACHE_ENABLED=true
 ANALYSIS_MODEL_CACHE_DIR=.cache/models
 ```
 
+MySQLの場合は`DATABASE_URL=mysql+pymysql://user:password@host:3306/database?charset=utf8mb4`を指定します。
+
 `DATABASE_URL`が設定されている場合、ランキング本体、処理ステータス、プライム銘柄一覧、当日分析キャッシュをDBへ保存します。初回接続時に`kabumikke_store`テーブルを自動作成します。DB未設定または一時的な接続障害の場合は、従来のCSV・JSON・キャッシュファイルを使用します。
 
 `PRIME_RANKING_WORKERS`は候補銘柄の並列分析数です。無料データ取得サービスへの負荷を抑えるため1～4に制限され、既定値は3です。
