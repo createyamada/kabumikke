@@ -77,6 +77,37 @@ class EdinetAndCrossSectionalTest(unittest.TestCase):
         self.assertFalse(result.empty)
         self.assertEqual(result.iloc[0]["market_benchmark_source"], "prime_universe_median_fallback")
 
+    def test_stale_running_status_is_recovered_after_worker_disappears(self):
+        previous_dir = os.environ.get("PRIME_RANKING_DIR")
+        previous_timeout = os.environ.get("PRIME_RANKING_STALE_SECONDS")
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                os.environ["PRIME_RANKING_DIR"] = directory
+                os.environ["PRIME_RANKING_STALE_SECONDS"] = "60"
+                old = (now_jst() - pd.Timedelta(minutes=5)).isoformat()
+                Path(directory, "analysis_status.json").write_text(json.dumps({
+                    "status": "running",
+                    "started_at": old,
+                    "updated_at": old,
+                    "phase": "analyzing_candidates",
+                    "progress_percent": 48,
+                }), encoding="utf-8")
+
+                status = read_status()
+
+                self.assertEqual(status["status"], "failed")
+                self.assertTrue(status["stale_recovered"])
+                self.assertTrue(status["refresh_allowed"])
+        finally:
+            if previous_dir is None:
+                os.environ.pop("PRIME_RANKING_DIR", None)
+            else:
+                os.environ["PRIME_RANKING_DIR"] = previous_dir
+            if previous_timeout is None:
+                os.environ.pop("PRIME_RANKING_STALE_SECONDS", None)
+            else:
+                os.environ["PRIME_RANKING_STALE_SECONDS"] = previous_timeout
+
     def test_edinet_csv_metrics_are_extracted(self):
         frame = pd.DataFrame({
             "要素ID": ["NetSales", "OperatingIncome", "Assets", "Equity"],

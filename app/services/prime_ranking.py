@@ -154,9 +154,40 @@ def write_progress(started_at, phase, phase_label, progress_percent, **values):
     return write_status("running", **{key: value for key, value in payload.items() if key != "status"})
 
 
+def recover_stale_status(payload):
+    """コンテナ停止などで取り残された実行中ステータスを解除する。"""
+    if not isinstance(payload, dict) or payload.get("status") not in {"queued", "running"}:
+        return payload
+    timestamp = payload.get("updated_at") or payload.get("started_at")
+    try:
+        updated = datetime.fromisoformat(timestamp)
+        updated = updated.replace(tzinfo=JST) if updated.tzinfo is None else updated.astimezone(JST)
+    except (TypeError, ValueError):
+        updated = None
+    stale_seconds = max(60, int(os.getenv("PRIME_RANKING_STALE_SECONDS", "600")))
+    age_seconds = (now_jst() - updated).total_seconds() if updated is not None else stale_seconds + 1
+    if age_seconds <= stale_seconds:
+        return payload
+
+    recovered_at = now_jst().isoformat()
+    values = {key: value for key, value in payload.items() if key != "status"}
+    values.update({
+        "failed_at": recovered_at,
+        "updated_at": recovered_at,
+        "phase": "failed",
+        "phase_label": "中断されたランキング処理を解除しました",
+        "error": "ranking worker stopped without completing",
+        "stale_recovered": True,
+        "stale_age_seconds": round(age_seconds),
+        "progress_percent": float(payload.get("progress_percent", 0.0)),
+    })
+    return write_status("failed", **values)
+
+
 def read_status():
     stored = database.get_json("prime_ranking", "status")
     if stored is not None:
+        stored = recover_stale_status(stored)
         stored["latest_csv_exists"] = ranking_paths()["latest"].exists()
         stored["storage_backend"] = "database"
         stored.update(refresh_availability())
@@ -168,7 +199,7 @@ def read_status():
             "latest_csv_exists": ranking_paths()["latest"].exists(),
             **refresh_availability(),
         }
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = recover_stale_status(json.loads(path.read_text(encoding="utf-8")))
     payload["latest_csv_exists"] = ranking_paths()["latest"].exists()
     payload["storage_backend"] = "file"
     payload.update(refresh_availability())
