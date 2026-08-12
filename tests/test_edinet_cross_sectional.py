@@ -93,8 +93,8 @@ class EdinetAndCrossSectionalTest(unittest.TestCase):
                 self.assertTrue(result["available"])
                 self.assertEqual(result["ranking"][0]["code"], "5802")
                 self.assertEqual(result["ranking"][0]["positive_factors"], ["positive"])
-                self.assertFalse(result["refresh_allowed"])
-                self.assertEqual(read_status()["refresh_block_reason"], "ranking_already_generated_today")
+                self.assertTrue(result["refresh_allowed"])
+                self.assertIsNone(read_status()["refresh_block_reason"])
         finally:
             if previous is None:
                 os.environ.pop("PRIME_RANKING_DIR", None)

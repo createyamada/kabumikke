@@ -349,7 +349,7 @@ def _save_cached_features(code, market_date, data):
     )
 
 
-def get_prediction(code, preloaded=None, company_name=None):
+def get_prediction(code, preloaded=None, company_name=None, force_recalculate=False):
     """
     コードから明日の株価の予想をする
 
@@ -363,7 +363,7 @@ def get_prediction(code, preloaded=None, company_name=None):
         raise HTTPException(status_code=422, detail="銘柄コードは4桁の数字で指定してください。")
 
     expected_market_date = latest_completed_market_date()
-    cached_payload = _load_cached_payload(code, expected_market_date)
+    cached_payload = None if force_recalculate else _load_cached_payload(code, expected_market_date)
     if cached_payload is not None:
         return {
             'prediction': cached_payload['prediction'],
@@ -384,7 +384,7 @@ def get_prediction(code, preloaded=None, company_name=None):
         # 分析に必要な学習用、検証用データに分ける
         divided_datas = format.get_divided_data(datas)
         market_date = str(datas.index[-1].date())
-        cached_payload = _load_cached_payload(code, market_date)
+        cached_payload = None if force_recalculate else _load_cached_payload(code, market_date)
         if cached_payload is None:
             price_prediction = price_predict(divided_datas, code=code)
             try:

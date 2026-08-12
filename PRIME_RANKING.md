@@ -42,7 +42,7 @@ EDINET財務分析もランキングへ反映する場合は、`EDINET_API_KEY`�
 POST /api/prime-ranking/refresh?limit=10&shortlist_size=50
 ```
 
-処理はバックグラウンドで開始され、すぐに`202 Accepted`を返します。`shortlist_size`は高度分析を行う候補数で、10～200件を指定できます。
+処理はバックグラウンドで開始され、すぐに`202 Accepted`を返します。互換性のため`shortlist_size`を受け付けますが、現在は値にかかわらず、株価履歴を取得できる東証プライム全銘柄を高度分析します。同じ日に何度でも再実行でき、正常完了時に最新結果を上書きします。
 
 ## 状態確認
 
@@ -52,12 +52,12 @@ GET /api/prime-ranking/status
 
 `status`は`not_started`、`running`、`completed`、`failed`のいずれかです。
 
-状態レスポンスの`refresh_allowed`が`false`の場合、フロントの更新ボタンを無効化してください。
+処理中は状態レスポンスの`status`が`queued`、`running`または`already_running`になります。この間だけ更新ボタンを無効化してください。
 
 ```json
 {
-  "refresh_allowed": false,
-  "refresh_block_reason": "ranking_already_generated_today",
+  "refresh_allowed": true,
+  "refresh_block_reason": null,
   "latest_generated_date": "2026-08-05",
   "today_jst": "2026-08-05"
 }

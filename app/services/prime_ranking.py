@@ -76,10 +76,11 @@ def latest_ranking_date():
 def refresh_availability():
     generated_date = latest_ranking_date()
     today = now_jst().date().isoformat()
-    allowed = generated_date != today
     return {
-        "refresh_allowed": allowed,
-        "refresh_block_reason": None if allowed else "ranking_already_generated_today",
+        # Completed rankings are atomically overwritten, so reruns on the same
+        # day are allowed. Concurrent execution is guarded by _worker_lock.
+        "refresh_allowed": True,
+        "refresh_block_reason": None,
         "latest_generated_date": generated_date,
         "today_jst": today,
     }
@@ -473,6 +474,7 @@ def enrich_candidate(row, preloaded=None):
     """既存の単銘柄高度分析を候補銘柄へ適用し、ランキング用の平坦な行へ変換する。"""
     result = analysis.get_prediction(
         row["code"], preloaded=preloaded, company_name=row.get("company"),
+        force_recalculate=True,
     )
     prediction = result["prediction"]
     horizon5 = prediction.get("horizon_predictions", {}).get("5", {})
@@ -597,10 +599,8 @@ def atomic_replace_ranking(frame):
 
 
 def build_prime_ranking(limit=10, shortlist_size=50):
-    if not refresh_availability()["refresh_allowed"]:
-        raise RuntimeError("ranking_already_generated_today")
     started = now_jst().isoformat()
-    common = {"analyzed_count": 0, "processed_count": 0, "failed_count": 0, "total_count": shortlist_size}
+    common = {"analyzed_count": 0, "processed_count": 0, "failed_count": 0, "total_count": 0}
     write_progress(started, "fetching_universe", "東証プライム銘柄一覧を取得中", 2, **common)
     try:
         universe = fetch_prime_universe()
@@ -633,8 +633,11 @@ def build_prime_ranking(limit=10, shortlist_size=50):
             global_scores = None
         write_progress(started, "screening", "テクニカル指標で候補を抽出中", 36, **common)
         screened = screen_prime_universe(universe, close, volume, topix, global_scores=global_scores)
-        target_count = min(shortlist_size, len(screened))
-        candidates = screened.head(shortlist_size).copy()
+        # The screening score determines the final order, but every Prime stock
+        # with sufficient price history proceeds to the expensive analysis.
+        # shortlist_size remains in the API signature for backward compatibility.
+        candidates = screened.copy()
+        target_count = len(candidates)
         common.update(screening_count=int(len(screened)), total_count=int(target_count))
         write_progress(started, "preloading_candidate_data", "候補銘柄の共通データを一括取得中", 40, **common)
         preloaded_by_code = download_candidate_analysis_data(candidates)
@@ -699,9 +702,6 @@ def _ranking_process_worker(limit, shortlist_size):
 
 
 def start_prime_ranking_refresh(limit=10, shortlist_size=50):
-    availability = refresh_availability()
-    if not availability["refresh_allowed"]:
-        return {"status": "already_generated_today", **availability}
     if not _worker_lock.acquire(blocking=False):
         return {"status": "already_running"}
 
@@ -710,7 +710,7 @@ def start_prime_ranking_refresh(limit=10, shortlist_size=50):
         "queued", started_at=queued_at, updated_at=queued_at,
         phase="queued", phase_label="ランキング処理を開始しています",
         progress_percent=0.0, analyzed_count=0, processed_count=0,
-        failed_count=0, total_count=shortlist_size,
+        failed_count=0, total_count=0,
     )
     process = None
     try:

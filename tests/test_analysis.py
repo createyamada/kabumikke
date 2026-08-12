@@ -172,6 +172,23 @@ class StockAnalysisTest(unittest.TestCase):
             else:
                 os.environ["ANALYSIS_MODEL_CACHE_DIR"] = previous
 
+    def test_forced_prediction_does_not_return_cached_result(self):
+        previous = os.environ.get("ANALYSIS_MODEL_CACHE_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                os.environ["ANALYSIS_MODEL_CACHE_DIR"] = directory
+                market_date = latest_completed_market_date()
+                _save_cached_prediction("5802", market_date, {"cached_only": True})
+                with self.assertRaises(Exception):
+                    # The lightweight yfinance stub has no Ticker. Reaching it
+                    # proves that force_recalculate bypassed the cached result.
+                    get_prediction("5802", force_recalculate=True)
+        finally:
+            if previous is None:
+                os.environ.pop("ANALYSIS_MODEL_CACHE_DIR", None)
+            else:
+                os.environ["ANALYSIS_MODEL_CACHE_DIR"] = previous
+
     def test_division_preserves_order_and_provides_full_training_set(self):
         divided = format.get_divided_data(self.make_data())
 
