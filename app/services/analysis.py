@@ -32,8 +32,8 @@ import yfinance as yf
 
 logger = logging.getLogger(__name__)
 HISTORY_PERIOD = "10y"
-ANALYSIS_CACHE_VERSION = "v5-hybrid"
-FEATURE_CACHE_VERSION = "v1"
+ANALYSIS_CACHE_VERSION = "v6-patterns"
+FEATURE_CACHE_VERSION = "v2"
 
 SECTOR_ETF_BY_KEYWORD = {
     'food': '1617.T', 'energy': '1618.T', 'oil': '1618.T',
@@ -1034,6 +1034,20 @@ def summarize_technical_analysis(divided_datas):
         score -= 4
     if number('doji', 0) > 0:
         neutral.append('十字線に近く方向感が弱い')
+    if number('upside_gap_side_by_side_white', 0) > 0:
+        positive.append('上放れ並び赤を検出')
+        score += 3
+    if number('island_bottom', 0) > 0:
+        positive.append('アイランドボトム候補を検出')
+        score += 4
+    if number('double_bottom_breakout', 0) > 0:
+        positive.append('ダブルボトムのネックライン上抜け候補')
+        score += 5
+    elif number('double_bottom_setup', 0) > 0:
+        neutral.append('ダブルボトム形成候補（上抜け未確認）')
+    if number('pampaka_pan_bull', 0) > 0:
+        positive.append('上昇パーフェクトオーダー（パンパカパン）')
+        score += 4
 
     latest_close = number('Close', divided_datas.get('last_close'))
     resistance_gap = number('resistance_gap20')
@@ -1074,6 +1088,18 @@ def summarize_technical_analysis(divided_datas):
             'bullish_engulfing': bool(number('bullish_engulfing', 0)),
             'bearish_engulfing': bool(number('bearish_engulfing', 0)),
             'doji': bool(number('doji', 0)),
+            'upside_gap_side_by_side_white': bool(number('upside_gap_side_by_side_white', 0)),
+            'island_bottom': bool(number('island_bottom', 0)),
+            'double_bottom_setup': bool(number('double_bottom_setup', 0)),
+            'double_bottom_breakout': bool(number('double_bottom_breakout', 0)),
+        },
+        'chart_patterns': {
+            'pampaka_pan_bull': bool(number('pampaka_pan_bull', 0)),
+            'pampaka_pan_strength': number('pampaka_pan_strength'),
+            'elliott_impulse_score': number('elliott_impulse_score'),
+            'elliott_wave_position': number('elliott_wave_position'),
+            'fibonacci_retracement_position60': number('fibonacci_retracement_position60'),
+            'elliott_method': 'causal_swing_proxy_not_discretionary_wave_count',
         },
         'oscillators': {
             'rsi14': rsi, 'stochastic_k': number('stochastic_k'),

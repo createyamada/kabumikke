@@ -121,9 +121,15 @@ def merge_all_company_info(infos: list):
 
     # 価格水準ではなく、銘柄や相場局面をまたいで比較できる比率を特徴量にする。
     merged_df['return_1d'] = merged_df['Close'].pct_change()
+    merged_df['return_2d'] = merged_df['Close'].pct_change(2)
+    merged_df['return_3d'] = merged_df['Close'].pct_change(3)
     merged_df['return_5d'] = merged_df['Close'].pct_change(5)
+    merged_df['return_10d'] = merged_df['Close'].pct_change(10)
     merged_df['return_20d'] = merged_df['Close'].pct_change(20)
+    merged_df['return_60d'] = merged_df['Close'].pct_change(60)
+    merged_df['overnight_return'] = merged_df['Open'] / merged_df['Close'].shift(1) - 1
     merged_df['intraday_return'] = merged_df['Close'] / merged_df['Open'] - 1
+    merged_df['intraday_range'] = (merged_df['High'] - merged_df['Low']) / merged_df['Close']
     merged_df['sma5_gap'] = merged_df['Close'] / merged_df['SMA5'] - 1
     merged_df['sma25_gap'] = merged_df['Close'] / merged_df['SMA25'] - 1
     merged_df['sma70_gap'] = merged_df['Close'] / merged_df['SMA70'] - 1
@@ -151,8 +157,18 @@ def merge_all_company_info(infos: list):
         (merged_df['Close'] - merged_df['SMA25']) / (2 * rolling_std.replace(0, np.nan))
     )
     merged_df['volatility20'] = merged_df['return_1d'].rolling(20).std()
+    merged_df['volatility5'] = merged_df['return_1d'].rolling(5).std()
+    merged_df['volatility60'] = merged_df['return_1d'].rolling(60).std()
+    merged_df['downside_volatility20'] = merged_df['return_1d'].clip(upper=0).rolling(20).std()
+    merged_df['return_skew20'] = merged_df['return_1d'].rolling(20).skew()
+    merged_df['atr14_change5'] = merged_df['atr14_rate'].pct_change(5).replace([np.inf, -np.inf], np.nan)
     merged_df['volume_change'] = merged_df['Volume'].pct_change()
     merged_df['volume_ratio20'] = merged_df['Volume'] / merged_df['Volume'].rolling(20).mean() - 1
+    merged_df['volume_ratio60'] = merged_df['Volume'] / merged_df['Volume'].rolling(60).mean() - 1
+    traded_value = (merged_df['Close'] * merged_df['Volume']).replace(0, np.nan)
+    merged_df['amihud_illiquidity20'] = (
+        (merged_df['return_1d'].abs() / traded_value).rolling(20).mean() * 1e9
+    )
 
     # 移動平均線の相互関係、クロス、傾き、並び順。
     merged_df['sma5_sma25_gap'] = merged_df['SMA5'] / merged_df['SMA25'] - 1
@@ -208,6 +224,60 @@ def merge_all_company_info(infos: list):
     merged_df['bullish_engulfing'] = (bullish_candle & bearish_candle.shift(1).fillna(False) & (candle_top >= previous_top) & (candle_bottom <= previous_bottom)).astype(float)
     merged_df['bearish_engulfing'] = (bearish_candle & bullish_candle.shift(1).fillna(False) & (candle_top >= previous_top) & (candle_bottom <= previous_bottom)).astype(float)
     merged_df['doji'] = (merged_df['candle_body_ratio'] <= 0.10).astype(float)
+
+    # Reproducible, causal definitions of discretionary chart-pattern names.
+    similar_body = (
+        (merged_df['candle_body_ratio'] - merged_df['candle_body_ratio'].shift(1)).abs() <= 0.25
+    )
+    prior_up_gap = merged_df['Low'].shift(1) > merged_df['High'].shift(2)
+    merged_df['upside_gap_side_by_side_white'] = (
+        bullish_candle & bullish_candle.shift(1).fillna(False) & prior_up_gap & similar_body
+    ).astype(float)
+    prior_down_gap = merged_df['High'].shift(1) < merged_df['Low'].shift(2)
+    current_up_gap = merged_df['Low'] > merged_df['High'].shift(1)
+    merged_df['island_bottom'] = (prior_down_gap & current_up_gap & bullish_candle).astype(float)
+
+    first_low = merged_df['Low'].rolling(15).min().shift(15)
+    second_low = merged_df['Low'].rolling(15).min()
+    bottom_tolerance = (first_low - second_low).abs() / first_low.replace(0, np.nan)
+    neckline = merged_df['High'].rolling(15).max().shift(1)
+    double_bottom = (bottom_tolerance <= 0.03) & (merged_df['Close'] > second_low * 1.02)
+    merged_df['double_bottom_setup'] = double_bottom.astype(float)
+    merged_df['double_bottom_breakout'] = (
+        double_bottom & (merged_df['Close'] > neckline)
+    ).astype(float)
+
+    expanding_order = (
+        (merged_df['sma5_sma25_gap'] > merged_df['sma5_sma25_gap'].shift(5))
+        & (merged_df['sma25_sma70_gap'] > merged_df['sma25_sma70_gap'].shift(5))
+    )
+    merged_df['pampaka_pan_bull'] = (
+        bullish_order & expanding_order & (merged_df['Close'] > merged_df['SMA5'])
+    ).astype(float)
+    merged_df['pampaka_pan_strength'] = (
+        merged_df['sma5_sma25_gap'].clip(lower=0)
+        + merged_df['sma25_sma70_gap'].clip(lower=0)
+        + merged_df['sma25_slope5'].clip(lower=0)
+    )
+
+    # Elliott-wave counting is subjective, so expose causal swing/momentum
+    # proxies and Fibonacci position rather than a falsely precise wave label.
+    swing_high = merged_df['High'] > merged_df['High'].rolling(5).max().shift(1)
+    swing_low = merged_df['Low'] < merged_df['Low'].rolling(5).min().shift(1)
+    up_swings = swing_high.astype(float).rolling(20).sum()
+    down_swings = swing_low.astype(float).rolling(20).sum()
+    merged_df['elliott_impulse_score'] = (
+        (up_swings - down_swings) / (up_swings + down_swings).replace(0, np.nan)
+    ).fillna(0)
+    rolling_low60 = merged_df['Low'].rolling(60).min()
+    rolling_high60 = merged_df['High'].rolling(60).max()
+    price_range60 = (rolling_high60 - rolling_low60).replace(0, np.nan)
+    merged_df['elliott_wave_position'] = (
+        (merged_df['Close'] - rolling_low60) / price_range60
+    ).clip(0, 1)
+    merged_df['fibonacci_retracement_position60'] = (
+        (rolling_high60 - merged_df['Close']) / price_range60
+    ).clip(0, 1)
 
     # ストキャスティクス、DMI/ADX、ROC、CCI。
     lowest14 = merged_df['Low'].rolling(14).min()

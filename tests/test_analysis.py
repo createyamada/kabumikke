@@ -259,6 +259,10 @@ class StockAnalysisTest(unittest.TestCase):
             "sma5_sma25_gap", "golden_cross", "distance_from_high252",
             "candle_body_ratio", "stochastic_k", "adx14", "cci20", "mfi14",
             "vwap20_gap", "ichimoku_cloud_position", "volume_profile_poc_gap",
+            "bullish_engulfing", "upside_gap_side_by_side_white", "island_bottom",
+            "double_bottom_setup", "double_bottom_breakout", "pampaka_pan_bull",
+            "elliott_impulse_score", "elliott_wave_position",
+            "fibonacci_retracement_position60", "amihud_illiquidity20",
         ):
             self.assertIn(column, original.columns)
             self.assertAlmostEqual(original[column].iloc[-2], changed_future[column].iloc[-2])
