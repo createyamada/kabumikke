@@ -139,7 +139,11 @@ def train_and_promote(close, volume, universe, topix=None, market_date=None):
     if len(dates) < 80:
         raise ValueError("global model requires at least 80 market sessions")
     validation_dates = dates[-max(20, len(dates) // 5):]
-    train = _cap_training_rows(panel[~panel.index.get_level_values("date").isin(validation_dates)])
+    # The target at date t uses close(t+1). Purge the session immediately before
+    # validation so its label cannot reach into the validation period.
+    earlier_dates = dates[dates < validation_dates[0]]
+    training_dates = earlier_dates[:-1]
+    train = _cap_training_rows(panel[panel.index.get_level_values("date").isin(training_dates)])
     valid = panel[panel.index.get_level_values("date").isin(validation_dates)]
 
     comparisons = {}
@@ -152,6 +156,9 @@ def train_and_promote(close, volume, universe, topix=None, market_date=None):
         fitted[name] = (model, prediction)
     selected = min(comparisons, key=comparisons.get)
     validation_prediction = fitted[selected][1]
+    validation_rank_ic = pd.Series(validation_prediction).corr(
+        pd.Series(valid["target"].to_numpy()), method="spearman"
+    )
     residual = valid["target"].to_numpy() - validation_prediction
     sector_frame = pd.DataFrame({"sector": valid["sector"].to_numpy(), "residual": residual})
     sector_corrections = sector_frame.groupby("sector")["residual"].agg(
@@ -170,6 +177,7 @@ def train_and_promote(close, volume, universe, topix=None, market_date=None):
         "market_date": market_date or str(dates[-1].date()),
         "selected_model": selected,
         "validation_rmse": candidate_rmse,
+        "validation_rank_ic": float(validation_rank_ic) if pd.notna(validation_rank_ic) else 0.0,
         "model_comparison": comparisons,
         "training_rows": int(len(final_data)),
         "validation_rows": int(len(valid)),
@@ -190,6 +198,36 @@ def train_and_promote(close, volume, universe, topix=None, market_date=None):
     if promoted:
         _save_champion(artifact)
     return metadata
+
+
+def score_universe(close, volume, topix=None):
+    """Score every stock using the persisted champion at the latest market date."""
+    artifact = load_champion()
+    if not artifact:
+        return pd.DataFrame(columns=["symbol", "global_predicted_return"])
+    close = close.sort_index().ffill()
+    volume = volume.reindex_like(close).fillna(0)
+    returns = close.pct_change()
+    market_return = _market_series(close, topix)
+    market_20 = (1 + market_return).rolling(20).apply(np.prod, raw=True) - 1
+    latest = pd.DataFrame({
+        "return_1d": returns.iloc[-1],
+        "return_5d": close.pct_change(5).iloc[-1],
+        "return_20d": close.pct_change(20).iloc[-1],
+        "volatility_20": returns.rolling(20).std().iloc[-1],
+        "sma20_gap": (close / close.rolling(20).mean() - 1).iloc[-1],
+        "volume_ratio_20": (volume / volume.rolling(20).mean().replace(0, np.nan) - 1).iloc[-1],
+        "market_return_1d": float(market_return.iloc[-1]),
+        "market_excess_20": close.pct_change(20).iloc[-1] - float(market_20.iloc[-1]),
+    }).replace([np.inf, -np.inf], np.nan).dropna()
+    if latest.empty:
+        return pd.DataFrame(columns=["symbol", "global_predicted_return"])
+    prediction = artifact["model"].predict(latest[artifact["features"]])
+    return pd.DataFrame({
+        "symbol": latest.index.astype(str),
+        "global_predicted_return": prediction,
+        "global_model_rank": pd.Series(prediction).rank(pct=True).to_numpy(),
+    })
 
 
 def features_from_stock_data(source):
@@ -225,7 +263,9 @@ def predict_for_stock(source, dates, sector_name=None):
     correction = float(artifact.get("sector_corrections", {}).get(str(sector_name), 0.0))
     return {
         "available": True,
-        "holdout_prediction": artifact["model"].predict(holdout[artifact["features"]]) + correction,
+        # Sector correction was calibrated after champion validation. Keep it out
+        # of historical holdout scoring, but apply it to the genuinely future row.
+        "holdout_prediction": artifact["model"].predict(holdout[artifact["features"]]),
         "latest_prediction": float(
             artifact["model"].predict(features.iloc[-1:][artifact["features"]])[0] + correction
         ),

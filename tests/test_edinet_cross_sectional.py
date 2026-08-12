@@ -15,7 +15,7 @@ sys.path.insert(0, str(APP_DIR))
 
 from services.cross_sectional import run_cross_sectional_backtest  # noqa: E402
 from services.edinet import EdinetClient, _read_csv_package, extract_financial_metrics, get_fundamental_analysis, score_fundamentals  # noqa: E402
-from services.prime_ranking import _bulk_symbol_frame, atomic_replace_ranking, now_jst, parse_prime_universe, read_latest_ranking, read_status, screen_prime_universe, sector_etf_symbol  # noqa: E402
+from services.prime_ranking import _bulk_symbol_frame, atomic_replace_ranking, now_jst, parse_prime_universe, read_latest_ranking, read_status, rerank_enriched_candidates, screen_prime_universe, sector_etf_symbol  # noqa: E402
 from services import hybrid_model  # noqa: E402
 
 
@@ -49,6 +49,7 @@ class EdinetAndCrossSectionalTest(unittest.TestCase):
                 self.assertTrue(metadata["promoted"])
                 self.assertTrue(prediction["available"])
                 self.assertEqual(len(prediction["holdout_prediction"]), 20)
+                self.assertIn("validation_rank_ic", metadata)
                 self.assertTrue(Path(directory, f"champion_{hybrid_model.MODEL_VERSION}.pkl").exists())
         finally:
             if previous is None:
@@ -113,6 +114,44 @@ class EdinetAndCrossSectionalTest(unittest.TestCase):
         result = screen_prime_universe(universe, close, volume, None)
         self.assertFalse(result.empty)
         self.assertEqual(result.iloc[0]["market_benchmark_source"], "prime_universe_median_fallback")
+
+    def test_global_prediction_changes_screening_priority(self):
+        index = pd.bdate_range("2025-01-01", periods=140)
+        close = pd.DataFrame({
+            "5802.T": np.linspace(100, 130, len(index)),
+            "6501.T": np.linspace(100, 120, len(index)),
+        }, index=index)
+        volume = pd.DataFrame(1000.0, index=index, columns=close.columns)
+        universe = pd.DataFrame({
+            "code": ["5802", "6501"], "company": ["A社", "B社"], "sector": ["非鉄金属", "電気機器"]
+        })
+        global_scores = pd.DataFrame({
+            "symbol": ["5802.T", "6501.T"],
+            "global_predicted_return": [-0.01, 0.02],
+            "global_model_rank": [0.0, 1.0],
+        })
+
+        result = screen_prime_universe(universe, close, volume, None, global_scores)
+
+        self.assertEqual(result.iloc[0]["code"], "6501")
+
+    def test_final_ranking_uses_cross_sectional_prediction_quality(self):
+        candidates = pd.DataFrame({
+            "code": ["1001", "1002", "1003"],
+            "expected_value": [0.03, 0.01, -0.01],
+            "up_probability_5d": [0.7, 0.55, 0.3],
+            "predicted_excess_return": [0.02, 0.0, -0.02],
+            "loss_probability": [0.2, 0.45, 0.8],
+            "reward_risk_ratio": [2.0, 1.0, 0.5],
+            "confidence_score": [80, 60, 30],
+            "fundamental_score": [70, 60, 50],
+            "screening_score": [70, 80, 90],
+        })
+
+        result = rerank_enriched_candidates(candidates)
+
+        self.assertEqual(result["code"].tolist(), ["1001", "1002", "1003"])
+        self.assertTrue(result["total_score"].is_monotonic_decreasing)
 
     def test_stale_running_status_is_recovered_after_worker_disappears(self):
         previous_dir = os.environ.get("PRIME_RANKING_DIR")

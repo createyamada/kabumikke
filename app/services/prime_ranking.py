@@ -405,7 +405,7 @@ def download_candidate_analysis_data(candidates, period=None):
     return result
 
 
-def screen_prime_universe(universe, close, volume, topix):
+def screen_prime_universe(universe, close, volume, topix, global_scores=None):
     """全銘柄をベクトル演算し、高度分析候補をランキングする。"""
     close = close.ffill()
     if close.empty or len(close) < 61:
@@ -441,11 +441,19 @@ def screen_prime_universe(universe, close, volume, topix):
     })
     table["code"] = table["symbol"].str.extract(r"(\d{4})", expand=False)
     table = table.merge(universe[["code", "company", "sector"]], on="code", how="inner")
+    if global_scores is not None and not global_scores.empty:
+        table = table.merge(global_scores, on="symbol", how="left")
+    else:
+        table["global_predicted_return"] = np.nan
+        table["global_model_rank"] = np.nan
     table = table.replace([np.inf, -np.inf], np.nan).dropna(subset=["return_20d", "volatility_20d"])
+    global_rank = table["global_model_rank"].fillna(0.5)
+    # 共通モデルの翌日予測を主軸にしつつ、中期モメンタム、流動性、
+    # リスクを組み合わせる。固定値ではなく全銘柄内の順位で比較する。
     table["screening_score"] = 100 * (
-        0.25 * table["return_20d"].rank(pct=True)
-        + 0.25 * table["topix_excess_return_20d"].rank(pct=True)
-        + 0.15 * table["return_60d"].rank(pct=True)
+        0.35 * global_rank
+        + 0.20 * table["topix_excess_return_20d"].rank(pct=True)
+        + 0.10 * table["return_60d"].rank(pct=True)
         + 0.10 * table["volume_ratio_20d"].rank(pct=True)
         + 0.15 * table["average_turnover_20d"].rank(pct=True)
         + 0.10 * (1 - table["volatility_20d"].rank(pct=True))
@@ -518,6 +526,54 @@ def enrich_candidate(row, preloaded=None):
     }
 
 
+def rerank_enriched_candidates(frame):
+    """高度分析結果を候補間の相対順位へ変換し、尺度差を排除する。"""
+    result = frame.copy()
+
+    def numeric(name, neutral=0.0):
+        if name not in result:
+            return pd.Series(neutral, index=result.index, dtype=float)
+        return pd.to_numeric(result[name], errors="coerce")
+
+    expected = numeric("expected_value")
+    probability = numeric("up_probability_5d", 0.5)
+    excess = numeric("predicted_excess_return")
+    confidence = numeric("confidence_score", 50)
+    fundamentals = numeric("fundamental_score", 50)
+    loss = numeric("loss_probability", 0.5)
+    reward_risk = numeric("reward_risk_ratio", 1.0)
+    screening = numeric("screening_score", 50)
+
+    # 欠損は有利にも不利にもならない中央値へ置く。
+    signals = {
+        "expected_rank": expected.fillna(expected.median()).rank(pct=True),
+        "probability_rank": probability.fillna(0.5).rank(pct=True),
+        "excess_rank": excess.fillna(excess.median()).rank(pct=True),
+        "confidence_rank": confidence.fillna(50).rank(pct=True),
+        "fundamental_rank": fundamentals.fillna(50).rank(pct=True),
+        "reward_risk_rank": reward_risk.fillna(1).rank(pct=True),
+        "screening_rank": screening.fillna(50).rank(pct=True),
+        "loss_safety_rank": 1 - loss.fillna(0.5).rank(pct=True),
+    }
+    for name, values in signals.items():
+        result[name] = values
+
+    result["total_score"] = 100 * (
+        0.20 * result["expected_rank"]
+        + 0.20 * result["probability_rank"]
+        + 0.15 * result["excess_rank"]
+        + 0.10 * result["reward_risk_rank"]
+        + 0.10 * result["loss_safety_rank"]
+        + 0.10 * result["confidence_rank"]
+        + 0.10 * result["screening_rank"]
+        + 0.05 * result["fundamental_rank"]
+    )
+    return result.sort_values(
+        ["total_score", "expected_value", "screening_score"],
+        ascending=[False, False, False], na_position="last",
+    ).reset_index(drop=True)
+
+
 def atomic_replace_ranking(frame):
     paths = ranking_paths()
     paths["temporary"].parent.mkdir(parents=True, exist_ok=True)
@@ -569,12 +625,14 @@ def build_prime_ranking(limit=10, shortlist_size=50):
                 market_date=analysis.latest_completed_market_date(),
             )
             common["global_model"] = global_model
+            global_scores = hybrid_model.score_universe(close, volume, topix)
         except Exception as error:
             # Ranking and stock-specific analysis remain available even when the
             # optional global challenger cannot be trained.
             common["global_model"] = {"available": False, "error": str(error)}
+            global_scores = None
         write_progress(started, "screening", "テクニカル指標で候補を抽出中", 36, **common)
-        screened = screen_prime_universe(universe, close, volume, topix)
+        screened = screen_prime_universe(universe, close, volume, topix, global_scores=global_scores)
         target_count = min(shortlist_size, len(screened))
         candidates = screened.head(shortlist_size).copy()
         common.update(screening_count=int(len(screened)), total_count=int(target_count))
@@ -614,7 +672,7 @@ def build_prime_ranking(limit=10, shortlist_size=50):
         if not enriched:
             raise RuntimeError("all advanced candidate analyses failed")
         write_progress(started, "saving", "ランキングCSVを検証・保存中", 97, **common)
-        ranking = pd.DataFrame(enriched).sort_values("total_score", ascending=False).reset_index(drop=True)
+        ranking = rerank_enriched_candidates(pd.DataFrame(enriched))
         ranking.insert(0, "rank", np.arange(1, len(ranking) + 1))
         completed = now_jst()
         ranking["generated_date"] = completed.date().isoformat()
