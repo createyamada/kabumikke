@@ -16,9 +16,46 @@ sys.path.insert(0, str(APP_DIR))
 from services.cross_sectional import run_cross_sectional_backtest  # noqa: E402
 from services.edinet import EdinetClient, _read_csv_package, extract_financial_metrics, get_fundamental_analysis, score_fundamentals  # noqa: E402
 from services.prime_ranking import _bulk_symbol_frame, atomic_replace_ranking, now_jst, parse_prime_universe, read_latest_ranking, read_status, screen_prime_universe, sector_etf_symbol  # noqa: E402
+from services import hybrid_model  # noqa: E402
 
 
 class EdinetAndCrossSectionalTest(unittest.TestCase):
+    def test_global_model_is_saved_and_predicts_with_sector_correction(self):
+        previous = os.environ.get("GLOBAL_MODEL_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                os.environ["GLOBAL_MODEL_DIR"] = directory
+                index = pd.bdate_range("2025-01-01", periods=140)
+                random = np.random.default_rng(42)
+                symbols = ["1001.T", "1002.T", "1003.T", "1004.T"]
+                returns = pd.DataFrame(
+                    random.normal(0.0005, 0.01, (len(index), len(symbols))),
+                    index=index, columns=symbols,
+                )
+                close = 100 * (1 + returns).cumprod()
+                volume = pd.DataFrame(100000.0, index=index, columns=symbols)
+                universe = pd.DataFrame({
+                    "code": ["1001", "1002", "1003", "1004"],
+                    "sector": ["機械", "機械", "食品", "食品"],
+                })
+
+                metadata = hybrid_model.train_and_promote(close, volume, universe)
+                source = pd.DataFrame({
+                    "Close": close["1001.T"], "Volume": volume["1001.T"],
+                    "topix_return": close.pct_change().median(axis=1),
+                })
+                prediction = hybrid_model.predict_for_stock(source, index[-20:], "機械")
+
+                self.assertTrue(metadata["promoted"])
+                self.assertTrue(prediction["available"])
+                self.assertEqual(len(prediction["holdout_prediction"]), 20)
+                self.assertTrue(Path(directory, f"champion_{hybrid_model.MODEL_VERSION}.pkl").exists())
+        finally:
+            if previous is None:
+                os.environ.pop("GLOBAL_MODEL_DIR", None)
+            else:
+                os.environ["GLOBAL_MODEL_DIR"] = previous
+
     def test_bulk_market_data_is_split_and_sector_is_mapped(self):
         columns = pd.MultiIndex.from_product([["Close", "Open"], ["5802.T", "^N225"]])
         downloaded = pd.DataFrame([[100, 200, 99, 198]], columns=columns)

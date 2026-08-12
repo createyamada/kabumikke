@@ -561,6 +561,18 @@ def build_prime_ranking(limit=10, shortlist_size=50):
         close, volume, topix = download_market_matrices(
             universe["code"].tolist(), progress_callback=market_progress,
         )
+        write_progress(started, "training_global_model", "市場共通モデルを学習・評価中", 35, **common)
+        try:
+            from services import hybrid_model
+            global_model = hybrid_model.train_and_promote(
+                close, volume, universe, topix,
+                market_date=analysis.latest_completed_market_date(),
+            )
+            common["global_model"] = global_model
+        except Exception as error:
+            # Ranking and stock-specific analysis remain available even when the
+            # optional global challenger cannot be trained.
+            common["global_model"] = {"available": False, "error": str(error)}
         write_progress(started, "screening", "テクニカル指標で候補を抽出中", 36, **common)
         screened = screen_prime_universe(universe, close, volume, topix)
         target_count = min(shortlist_size, len(screened))

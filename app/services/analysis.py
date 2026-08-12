@@ -32,7 +32,7 @@ import yfinance as yf
 
 logger = logging.getLogger(__name__)
 HISTORY_PERIOD = "10y"
-ANALYSIS_CACHE_VERSION = "v4"
+ANALYSIS_CACHE_VERSION = "v5-hybrid"
 FEATURE_CACHE_VERSION = "v1"
 
 SECTOR_ETF_BY_KEYWORD = {
@@ -386,7 +386,7 @@ def get_prediction(code, preloaded=None, company_name=None):
         market_date = str(datas.index[-1].date())
         cached_payload = _load_cached_payload(code, market_date)
         if cached_payload is None:
-            price_prediction = price_predict(divided_datas)
+            price_prediction = price_predict(divided_datas, code=code)
             try:
                 price_prediction['fundamental_analysis'] = edinet.get_fundamental_analysis(code)
             except Exception:
@@ -1094,7 +1094,7 @@ def summarize_technical_analysis(divided_datas):
     }
 
 
-def price_predict(divided_datas):
+def price_predict(divided_datas, code=None):
     """
     重回帰分析により予測する
 
@@ -1133,6 +1133,51 @@ def price_predict(divided_datas):
     # The selected holdout model was already fitted on exactly the same rows.
     evaluation_model = holdout_models[selected_model]
     Y_pred = holdout_predictions[selected_model]
+    local_Y_pred = np.asarray(Y_pred, dtype=float)
+    hybrid_analysis = {"available": False, "reason": "global_model_not_trained"}
+    global_latest_prediction = None
+    global_weight = 0.0
+    try:
+        from services import hybrid_model
+        source_data = divided_datas.get("source_data")
+        sector_name = source_data.attrs.get("sector_name") if source_data is not None else None
+        sector_name = hybrid_model.resolve_sector(code, sector_name)
+        global_result = hybrid_model.predict_for_stock(
+            source_data,
+            divided_datas["X_test"].index,
+            sector_name=sector_name,
+        )
+        if global_result.get("available"):
+            global_holdout = np.asarray(global_result["holdout_prediction"], dtype=float)
+            local_mse = float(mse(actual, local_Y_pred))
+            global_mse = float(mse(actual, global_holdout))
+            # Do not force a weak global model into the forecast. When it is
+            # competitive, inverse-error weighting determines its contribution.
+            if global_mse <= local_mse * 1.10:
+                global_weight = float(np.clip(local_mse / max(local_mse + global_mse, 1e-12), 0.10, 0.70))
+            Y_pred = (1 - global_weight) * local_Y_pred + global_weight * global_holdout
+            global_latest_prediction = global_result["latest_prediction"]
+            hybrid_analysis = {
+                "available": True,
+                "method": "dynamic_global_sector_stock_specific_blend",
+                "stock_specific_model": selected_model,
+                "global_weight": global_weight,
+                "stock_specific_weight": 1 - global_weight,
+                "local_holdout_rmse": float(np.sqrt(local_mse)),
+                "global_holdout_rmse": float(np.sqrt(global_mse)),
+                "sector_correction": global_result["sector_correction"],
+                "global_model": global_result["metadata"],
+                "global_model_used": bool(global_weight > 0),
+            }
+            model_comparison["hybrid_blend"] = {
+                "holdout_rmse": float(np.sqrt(mse(actual, Y_pred))),
+                "global_weight": global_weight,
+            }
+        else:
+            hybrid_analysis = global_result
+    except Exception as error:
+        logger.warning("global/local hybrid prediction unavailable", exc_info=True)
+        hybrid_analysis = {"available": False, "reason": "global_model_error", "error": str(error)}
 
     # 収益率として評価する。ゼロは「価格変化なし」の単純予測。
     return_score = np.sqrt(mse(actual, Y_pred))
@@ -1169,6 +1214,12 @@ def price_predict(divided_datas):
     )
     last_data = divided_datas['last_data'][available_columns].to_frame().T
     tomorrow_return = float(final_model.predict(last_data)[0])
+    local_tomorrow_return = tomorrow_return
+    if global_latest_prediction is not None and global_weight > 0:
+        tomorrow_return = float(
+            (1 - global_weight) * local_tomorrow_return
+            + global_weight * global_latest_prediction
+        )
     latest_close = divided_datas['last_close']
     tomorrow_prediction = latest_close * (1 + tomorrow_return)
 
@@ -1295,6 +1346,7 @@ def price_predict(divided_datas):
         'score': float(price_score),
         'target': 'next_day_return',
         'selected_model': selected_model,
+        'hybrid_model': hybrid_analysis,
         'predicted_return': tomorrow_return,
         'up_probability': up_probability,
         'direction_classifier': classifier_probability,

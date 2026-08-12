@@ -193,6 +193,7 @@ class StockAnalysisTest(unittest.TestCase):
         self.assertEqual(result["score"], result["metrics"]["rmse"])
         self.assertGreater(result["metrics"]["training_samples"], result["metrics"]["test_samples"])
         self.assertIn(result["selected_model"], result["model_comparison"])
+        self.assertIn("hybrid_model", result)
         self.assertIn("ridge", result["model_comparison"])
         self.assertIn("gradient_boosting", result["model_comparison"])
         self.assertTrue(result["feature_importance"])
