@@ -145,6 +145,35 @@ def get_json(namespace, key):
         return None
 
 
+def list_json(namespace, limit=10000):
+    """Return JSON records in a namespace, newest first."""
+    engine, table = _initialize()
+    if engine is None:
+        return []
+    try:
+        from sqlalchemy import select
+
+        statement = (
+            select(table.c.item_key, table.c.payload_json, table.c.updated_at)
+            .where(table.c.namespace == namespace)
+            .order_by(table.c.updated_at.desc())
+            .limit(max(1, int(limit)))
+        )
+        with engine.connect() as connection:
+            rows = connection.execute(statement).all()
+        result = []
+        for item_key, payload, updated_at in rows:
+            if payload is None:
+                continue
+            value = json.loads(payload)
+            if isinstance(value, dict):
+                value.setdefault("event_key", item_key)
+                value.setdefault("updated_at", updated_at.isoformat() if updated_at else None)
+            result.append(value)
+        return result
+    except Exception:
+        logger.exception("database list failed: namespace=%s", namespace)
+        return []
 def put_bytes(namespace, key, payload):
     return _put(namespace, key, binary_payload=payload)
 

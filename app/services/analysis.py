@@ -32,7 +32,7 @@ import yfinance as yf
 
 logger = logging.getLogger(__name__)
 HISTORY_PERIOD = "10y"
-ANALYSIS_CACHE_VERSION = "v6-patterns"
+ANALYSIS_CACHE_VERSION = "v7-feature-selection"
 FEATURE_CACHE_VERSION = "v2"
 
 SECTOR_ETF_BY_KEYWORD = {
@@ -462,8 +462,8 @@ def compare_models_walk_forward(features, target, columns, horizon=1):
     return selected_name, comparison
 
 
-def calculate_permutation_importance(model, features, target, columns, top_n=15):
-    """ホールドアウト誤差の増加量でモデル非依存の特徴量重要度を算出する。"""
+def calculate_permutation_importance(model, features, target, columns, top_n=15, repeats=5):
+    """反復シャッフルによるモデル非依存の特徴量重要度を算出する。"""
     if features.empty:
         return []
     X = features[columns].copy()
@@ -472,15 +472,51 @@ def calculate_permutation_importance(model, features, target, columns, top_n=15)
     random = np.random.default_rng(42)
     importance = []
     for column in columns:
-        shuffled = X.copy()
-        shuffled[column] = random.permutation(shuffled[column].to_numpy())
-        shuffled_error = float(mse(actual, model.predict(shuffled)))
+        increases = []
+        for _ in range(max(1, int(repeats))):
+            shuffled = X.copy()
+            shuffled[column] = random.permutation(shuffled[column].to_numpy())
+            shuffled_error = float(mse(actual, model.predict(shuffled)))
+            increases.append(shuffled_error - baseline)
         importance.append({
             'feature': column,
-            'mse_increase': float(shuffled_error - baseline),
+            'mse_increase': float(np.mean(increases)),
+            'mse_increase_std': float(np.std(increases)),
+            'positive_repeat_rate': float(np.mean(np.asarray(increases) > 0)),
+            'excluded': bool(np.mean(increases) <= 0),
         })
     importance.sort(key=lambda item: item['mse_increase'], reverse=True)
-    return importance[:top_n]
+    return importance[:top_n] if top_n is not None else importance
+
+
+def calculate_grouped_permutation_importance(model, features, target, columns, repeats=5):
+    """相関した特徴量を同時に崩し、特徴量グループ全体の寄与を測る。"""
+    from services import feature_selection
+
+    X = features[columns].copy()
+    if X.empty:
+        return []
+    actual = np.asarray(target, dtype=float)
+    baseline = float(mse(actual, model.predict(X)))
+    groups = {}
+    for column in columns:
+        groups.setdefault(feature_selection.feature_group(column), []).append(column)
+    random = np.random.default_rng(137)
+    result = []
+    for group, group_columns in groups.items():
+        increases = []
+        for _ in range(max(1, int(repeats))):
+            shuffled = X.copy()
+            order = random.permutation(len(shuffled))
+            shuffled.loc[:, group_columns] = shuffled[group_columns].to_numpy()[order]
+            increases.append(float(mse(actual, model.predict(shuffled))) - baseline)
+        result.append({
+            'group': group,
+            'features': group_columns,
+            'mse_increase': float(np.mean(increases)),
+            'mse_increase_std': float(np.std(increases)),
+        })
+    return sorted(result, key=lambda item: item['mse_increase'], reverse=True)
 
 
 def calculate_backtest(actual_returns, predicted_returns):
@@ -1130,8 +1166,14 @@ def price_predict(divided_datas, code=None):
     - result 予想結果
     """
 
-    # 説明変数の中で、X_train に存在するカラムのみを使用
-    available_columns = [col for col in config.EXPLANATORY_VARIABLES_ANALYSIS if col in divided_datas['X_train'].columns]
+    from services import feature_selection
+
+    source_data = divided_datas.get('source_data')
+    sector_name = source_data.attrs.get('sector_name') if source_data is not None else None
+    removed_features = set(feature_selection.get_removed_features())
+    # 十分なシャドー検証を通過した特徴量だけを本番学習から外す。
+    available_columns = [col for col in config.EXPLANATORY_VARIABLES_ANALYSIS
+                         if col in divided_datas['X_train'].columns and col not in removed_features]
 
     if not available_columns:
         raise ValueError("使用できる説明変数がありません。データの前処理を確認してください。")
@@ -1216,12 +1258,31 @@ def price_predict(divided_datas, code=None):
     predicted_direction = np.sign(Y_pred)
     directional_accuracy = np.mean(actual_direction == predicted_direction)
 
-    feature_importance = calculate_permutation_importance(
+    all_feature_importance = calculate_permutation_importance(
         evaluation_model,
         divided_datas['X_test'],
         actual,
         available_columns,
+        top_n=None,
     )
+    feature_importance = all_feature_importance[:15]
+    grouped_feature_importance = calculate_grouped_permutation_importance(
+        evaluation_model, divided_datas['X_test'], actual, available_columns,
+    )
+
+    # 候補は本番モデルを変えずに、同一ホールドアウト上のシャドーモデルで非劣性を検証する。
+    shadow_candidates = [name for name in feature_selection.get_shadow_candidates()
+                         if name in available_columns]
+    shadow_noninferior = None
+    shadow_rmse = None
+    if shadow_candidates and len(available_columns) - len(shadow_candidates) >= 5:
+        shadow_columns = [name for name in available_columns if name not in shadow_candidates]
+        shadow_model = get_candidate_models()[selected_model]()
+        shadow_model.fit(divided_datas['X_train'][shadow_columns], divided_datas['Y_train'])
+        shadow_prediction = shadow_model.predict(divided_datas['X_test'][shadow_columns])
+        shadow_rmse = float(np.sqrt(mse(actual, shadow_prediction)))
+        full_rmse = float(np.sqrt(mse(actual, local_Y_pred)))
+        shadow_noninferior = bool(shadow_rmse <= full_rmse * 1.01)
 
     current_close = divided_datas['current_close_test'].to_numpy()
     predicted_close = current_close * (1 + Y_pred)
@@ -1336,7 +1397,6 @@ def price_predict(divided_datas, code=None):
         probability_evaluation,
         interval_evaluation,
     )
-    source_data = divided_datas.get('source_data')
     excess_return_prediction = predict_topix_excess_return(divided_datas, available_columns)
     # Multi-window TDA is retained above for future use but is not calculated.
     # topology_multi_window = analyze_topology_multi_window(divided_datas)
@@ -1365,6 +1425,31 @@ def price_predict(divided_datas, code=None):
         'history_rows': int(len(source_data)) if source_data is not None else 0,
     }
 
+    market_date = str(pd.Timestamp(divided_datas['last_data'].name).date())
+    regime = 'unknown'
+    if 'volatility20' in divided_datas['X_all']:
+        volatility_history = divided_datas['X_all']['volatility20'].dropna()
+        if not volatility_history.empty:
+            latest_volatility = float(volatility_history.iloc[-1])
+            low_threshold, high_threshold = volatility_history.quantile([1 / 3, 2 / 3]).tolist()
+            regime = 'high_volatility' if latest_volatility >= high_threshold else (
+                'low_volatility' if latest_volatility <= low_threshold else 'normal_volatility'
+            )
+    evaluation_recorded = False
+    if code:
+        evaluation_recorded = feature_selection.record_evaluation(
+            code=code,
+            sector=sector_name,
+            model=selected_model,
+            market_date=market_date,
+            horizon=1,
+            importances=all_feature_importance,
+            shadow_features=shadow_candidates,
+            shadow_noninferior=shadow_noninferior,
+            analysis_version=ANALYSIS_CACHE_VERSION,
+            regime=regime,
+        )
+
     return {
         'close_next': result['Close_next'].to_dict(),
         'close_pred': result['Close_pred'].to_dict(),
@@ -1387,6 +1472,14 @@ def price_predict(divided_datas, code=None):
         'interval_evaluation': interval_evaluation,
         'model_comparison': model_comparison,
         'feature_importance': feature_importance,
+        'grouped_feature_importance': grouped_feature_importance,
+        'feature_selection': {
+            'evaluation_recorded': evaluation_recorded,
+            'removed_features': sorted(removed_features),
+            'shadow_candidates': shadow_candidates,
+            'shadow_noninferior': shadow_noninferior,
+            'shadow_rmse': shadow_rmse,
+        },
         'backtest': backtest,
         'topological_analysis': topology,
         'topological_analysis_multi_window': topology_multi_window,
